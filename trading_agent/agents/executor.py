@@ -59,18 +59,13 @@ def execute_decision(
                 decision.quantity,
                 allowed_quantity,
             )
-            return ExecutionResult(
-                decision.ticker,
-                decision.action,
-                "blocked",
-                None,
+            return _blocked_execution_result(
+                decision,
                 f"Invalid trade quantity: requested={decision.quantity}; BUY/SELL requires quantity > 0. {risk_explanation}.",
-                portfolio_before,
                 portfolio_before=portfolio_before,
-                requested_quantity=decision.quantity,
                 allowed_quantity=allowed_quantity,
                 risk_explanation=risk_explanation,
-                current_price_at_order=estimated_price,
+                estimated_price=estimated_price,
             )
         if decision.quantity > allowed_quantity:
             logger.warning(
@@ -79,33 +74,23 @@ def execute_decision(
                 decision.quantity,
                 allowed_quantity,
             )
-            return ExecutionResult(
-                decision.ticker,
-                decision.action,
-                "blocked",
-                None,
+            return _blocked_execution_result(
+                decision,
                 f"Quantity outside risk limits: requested={decision.quantity}, allowed={allowed_quantity}. {risk_explanation}.",
-                portfolio_before,
                 portfolio_before=portfolio_before,
-                requested_quantity=decision.quantity,
                 allowed_quantity=allowed_quantity,
                 risk_explanation=risk_explanation,
-                current_price_at_order=estimated_price,
+                estimated_price=estimated_price,
             )
         if cash <= 0 and decision.action == "BUY":
             logger.warning("executor.risk_block ticker=%s reason=insufficient_cash", decision.ticker)
-            return ExecutionResult(
-                decision.ticker,
-                decision.action,
-                "blocked",
-                None,
+            return _blocked_execution_result(
+                decision,
                 "Insufficient cash.",
-                portfolio_before,
                 portfolio_before=portfolio_before,
-                requested_quantity=decision.quantity,
                 allowed_quantity=allowed_quantity,
                 risk_explanation=risk_explanation,
-                current_price_at_order=estimated_price,
+                estimated_price=estimated_price,
             )
     except Exception as error:
         logger.error("executor.precheck.fail ticker=%s error=%s", decision.ticker, error)
@@ -202,6 +187,30 @@ def _wait_for_order_update(
         if _status_text(latest.get("status", "")) == "filled":
             return latest
     return latest
+
+
+def _blocked_execution_result(
+    decision: TradingDecision,
+    message: str,
+    *,
+    portfolio_before: dict,
+    allowed_quantity: int,
+    risk_explanation: str,
+    estimated_price: float | None,
+) -> ExecutionResult:
+    return ExecutionResult(
+        decision.ticker,
+        decision.action,
+        "blocked",
+        None,
+        message,
+        portfolio_before,
+        portfolio_before=portfolio_before,
+        requested_quantity=decision.quantity,
+        allowed_quantity=allowed_quantity,
+        risk_explanation=risk_explanation,
+        current_price_at_order=estimated_price,
+    )
 
 
 def _status_text(value) -> str:

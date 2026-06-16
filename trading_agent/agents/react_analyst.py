@@ -163,20 +163,7 @@ def _tool_observations(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     invoke_tools = getattr(llm_client, "invoke_tools", None)
     if callable(invoke_tools):
-        payload = json.dumps(
-            {
-                "snapshot": snapshot_payload(snapshot),
-                "recent_journal_count": len(recent_entries),
-                "available_tools": [
-                    "inspect_snapshot",
-                    "explain_technical_signals",
-                    "summarize_news_urls",
-                    "read_news_url",
-                    *([] if news_provider is None else ["search_market_news"]),
-                ],
-            },
-            default=str,
-        )
+        payload = _tool_payload(snapshot, recent_entries, news_provider)
         try:
             tools = langchain_market_context_tools(snapshot, recent_entries)
             if news_provider is not None:
@@ -197,20 +184,7 @@ def _request_tool_calls(
     llm_client: LlmClient,
     news_provider=None,
 ) -> list[dict[str, Any]]:
-    payload = json.dumps(
-        {
-            "snapshot": snapshot_payload(snapshot),
-            "recent_journal_count": len(recent_entries),
-            "available_tools": [
-                "inspect_snapshot",
-                "explain_technical_signals",
-                "summarize_news_urls",
-                "read_news_url",
-                *([] if news_provider is None else ["search_market_news"]),
-            ],
-        },
-        default=str,
-    )
+    payload = _tool_payload(snapshot, recent_entries, news_provider)
     try:
         planner = getattr(llm_client, "complete_tool_plan", None)
         if callable(planner):
@@ -225,6 +199,27 @@ def _request_tool_calls(
     if not isinstance(calls, list):
         return [{"name": "inspect_snapshot", "args": {}}]
     return [call for call in calls[:3] if isinstance(call, dict)]
+
+
+def _tool_payload(snapshot: MarketSnapshot, recent_entries: list[JournalEntry], news_provider=None) -> str:
+    return json.dumps(
+        {
+            "snapshot": snapshot_payload(snapshot),
+            "recent_journal_count": len(recent_entries),
+            "available_tools": _available_tool_names(news_provider),
+        },
+        default=str,
+    )
+
+
+def _available_tool_names(news_provider=None) -> list[str]:
+    return [
+        "inspect_snapshot",
+        "explain_technical_signals",
+        "summarize_news_urls",
+        "read_news_url",
+        *([] if news_provider is None else ["search_market_news"]),
+    ]
 
 
 def _with_tool_audit(details: dict[str, Any], observations: list[dict[str, Any]]) -> dict[str, Any]:
