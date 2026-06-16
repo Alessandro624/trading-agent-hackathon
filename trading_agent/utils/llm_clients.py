@@ -82,6 +82,38 @@ class OllamaJsonClient(_ChatJsonClientMixin):
                 num_predict=self.max_tokens,
             )
         return self._model_cache
+    
+
+class OpenRouterJsonClient(_ChatJsonClientMixin):
+    def __init__(
+        self,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> None:
+        self.model = model or os.getenv("OPENROUTER_MODEL", "poolside/laguna-xs.2:free")
+        self.base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OPENROUTER_TIMEOUT_SECONDS", 60)
+        self.temperature = temperature if temperature is not None else _env_float("OPENROUTER_TEMPERATURE", 0)
+        self.max_tokens = max_tokens if max_tokens is not None else _env_int("OPENROUTER_MAX_TOKENS", 1024)
+        self.provider_name = "openrouter"
+        self._model_cache = None
+
+    def _model(self):
+        if self._model_cache is None:
+            try:
+                from langchain_openrouter import ChatOpenRouter
+            except ImportError as error:
+                raise RuntimeError("Install LangChain dependencies with `uv sync` to use OpenRouter models.") from error
+            self._model_cache = ChatOpenRouter(
+                model=self.model, 
+                base_url=self.base_url,
+                temperature=self.temperature, 
+                timeout=self.timeout_seconds, 
+                max_tokens=self.max_tokens
+            )
+        return self._model_cache
 
 
 @dataclass
