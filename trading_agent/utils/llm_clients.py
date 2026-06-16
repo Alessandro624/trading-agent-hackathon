@@ -5,20 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-class OpenAiJsonClient:
-    def __init__(
-        self,
-        model: str | None = None,
-        timeout_seconds: float | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-    ) -> None:
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OPENAI_TIMEOUT_SECONDS", 60)
-        self.temperature = temperature if temperature is not None else _env_float("OPENAI_TEMPERATURE", 0)
-        self.max_tokens = max_tokens if max_tokens is not None else _env_int("OPENAI_MAX_TOKENS", 1024)
-        self.provider_name = "openai"
-        self._model_cache = None
+class _ChatJsonClientMixin:
+    provider_name: str
 
     def complete_json(self, system_prompt: str, user_prompt: str) -> str:
         message = self._model().invoke([("system", system_prompt), ("user", user_prompt)])
@@ -37,6 +25,22 @@ class OpenAiJsonClient:
     def metadata(self) -> dict:
         return _metadata(self.provider_name)
 
+
+class OpenAiJsonClient(_ChatJsonClientMixin):
+    def __init__(
+        self,
+        model: str | None = None,
+        timeout_seconds: float | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> None:
+        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OPENAI_TIMEOUT_SECONDS", 60)
+        self.temperature = temperature if temperature is not None else _env_float("OPENAI_TEMPERATURE", 0)
+        self.max_tokens = max_tokens if max_tokens is not None else _env_int("OPENAI_MAX_TOKENS", 1024)
+        self.provider_name = "openai"
+        self._model_cache = None
+
     def _model(self):
         if self._model_cache is None:
             try:
@@ -47,7 +51,7 @@ class OpenAiJsonClient:
         return self._model_cache
 
 
-class OllamaJsonClient:
+class OllamaJsonClient(_ChatJsonClientMixin):
     def __init__(
         self,
         model: str | None = None,
@@ -63,23 +67,6 @@ class OllamaJsonClient:
         self.max_tokens = max_tokens if max_tokens is not None else _env_int("OLLAMA_MAX_TOKENS", 1024)
         self.provider_name = "ollama"
         self._model_cache = None
-
-    def complete_json(self, system_prompt: str, user_prompt: str) -> str:
-        message = self._model().invoke([("system", system_prompt), ("user", user_prompt)])
-        return _message_content(message, self.provider_name)
-
-    def complete_structured(self, system_prompt: str, user_prompt: str, schema: type[Any]) -> Any:
-        return _structured_response(self._model(), system_prompt, user_prompt, schema)
-
-    def complete_tool_plan(self, system_prompt: str, user_prompt: str, tools: list[dict[str, Any]]) -> dict[str, Any]:
-        message = self._model().bind_tools(tools).invoke([("system", system_prompt), ("user", user_prompt)])
-        return {"tool_calls": _standard_tool_calls(message)}
-
-    def invoke_tools(self, system_prompt: str, user_prompt: str, tools: list[Any]) -> tuple[list[dict[str, Any]], dict]:
-        return _invoke_bound_tools(self._model(), system_prompt, user_prompt, tools)
-
-    def metadata(self) -> dict:
-        return _metadata(self.provider_name)
 
     def _model(self):
         if self._model_cache is None:
