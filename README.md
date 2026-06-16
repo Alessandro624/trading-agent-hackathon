@@ -28,13 +28,18 @@ trading-agent-hackathon/
 ├── trading-agent/
 │   ├── adapters/
 │   │   ├── alpaca_broker.py            # Alpaca Broker, able to get Portfolio info
-│   │   └── alpaca_market_data.py       # Alpaca Marker Data, able to get tickers' prices
+│   │   ├── alpaca_market_data.py       # Alpaca Marker Data, able to get tickers' prices
+│   │   └── news_provider.py            # News API Helper for currents available news
 │   ├── scripts/
 │   │   └── test_connection.py          # Simple Script to test the Connection with the Alpaca Market API
 │   └── utils/
 │       ├── __init__.py                 # Re-exports all config symbols
 │       ├── config.py                   # Configuration Info
-│       └── logger.py                   # Logger Info
+│       ├── http.py                     # Https Utils to request external files
+│       ├── llm_clients.py              # Availble Clients Config (OpenAI, Ollama)
+│       ├── llm_metadata.py             # Availble Clients Metadata
+│       ├── logger.py                   # Logger Info
+│       └── portfolio.py                # Portfolio Availablity Checks
 ├── pyproject.toml                      # v0.1.0, alpaca-py>=0.30, project scripts
 └── .env                                # API keys (not committed)
 ```
