@@ -8,6 +8,7 @@ from trading_agent.core.data_hygiene import clean_text
 from trading_agent.core.human_intent import parse_human_intent
 from trading_agent.core.portfolio import position_for
 from trading_agent.core.portfolio import positions as portfolio_positions
+from trading_agent.adapters.ticker_provider import TickerProvider
 
 _SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}\b")
 _ALIASES = {
@@ -42,7 +43,7 @@ def parse_watchlist(value: str | list[str] | tuple[str, ...]) -> list[str]:
     return symbols
 
 
-def select_ticker(
+def select_ticker_v0(
     watchlist: list[str],
     *,
     human_input: list[str],
@@ -122,3 +123,35 @@ def _selection_rationale(
         position_text = f"current position qty={position.get('qty', 0)} market_value={position.get('market_value', 0)}"
     input_text = "; ".join(human_input) if human_input else "no new human input"
     return f"{reason} Selected {ticker}; {position_text}; human_input={input_text}"
+
+
+def select_ticker(
+    watchlist: str,
+    *,
+    human_input: list[str],
+    portfolio: dict[str, Any] | None,
+    cycle_index: int,
+    fallback: str | None = None,
+) -> TickerSelection:
+
+    ticker_provider: TickerProvider = TickerProvider()
+
+    tickers_list = ticker_provider.get_tickers_with_info(watchlist)
+
+    mentioned = _mentioned_tickers(human_input, [t.name for t in tickers_list])
+    if mentioned:
+        ticker = mentioned[-1]
+        return TickerSelection(
+            ticker=ticker,
+            reason="human_input",
+            rationale=_selection_rationale(ticker, "Human input mentioned this ticker.", human_input, portfolio),
+            mentioned_tickers=mentioned,
+        )
+
+    ticker = tickers_list[0]
+    return TickerSelection(
+        ticker=ticker,
+        reason="most_valuable_by_metrics",
+        rationale=_selection_rationale(ticker, "Metrics used suggest this ticker as the most valuable.", human_input, portfolio),
+        mentioned_tickers=[],
+    )

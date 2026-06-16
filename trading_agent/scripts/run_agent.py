@@ -14,11 +14,20 @@ from trading_agent.adapters import AlpacaBrokerClient, AlpacaMarketDataProvider,
 from trading_agent.core import HumanInputStore, HumanInstruction, parse_watchlist, plan_human_instructions, select_ticker
 from trading_agent.journal import JournalStore, RunContext, create_run_context, print_cycle_log, render_dashboard
 from trading_agent.pipeline import build_graph, run_cycle
-from trading_agent.utils import FallbackLlmClient, OllamaJsonClient, OpenAiJsonClient, configure_logging, safe_portfolio_snapshot
+from trading_agent.utils import FallbackLlmClient, OllamaJsonClient, OpenAiJsonClient, OpenRouterJsonClient, configure_logging, safe_portfolio_snapshot
 
 
 def _build_adapters():
-    llm_client = FallbackLlmClient(primary=OpenAiJsonClient(), fallback=OllamaJsonClient())
+    import os
+
+    primary_provider: str = os.getenv("PRIMARY_PROVIDER", "openai")
+    llm_client: FallbackLlmClient
+
+    if primary_provider == "openrouter":
+        llm_client = FallbackLlmClient(primary=OpenRouterJsonClient(), fallback=OllamaJsonClient())
+    else:
+        llm_client = FallbackLlmClient(primary=OpenAiJsonClient(), fallback=OllamaJsonClient())
+    
     return AlpacaMarketDataProvider(), NewsApiProvider(), llm_client, AlpacaBrokerClient()
 
 
