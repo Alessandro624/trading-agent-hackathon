@@ -37,21 +37,8 @@ def run_market_context_tools(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     tools = {
         "inspect_snapshot": lambda: snapshot_payload(snapshot),
-        "explain_technical_signals": lambda: {
-            "summary": snapshot.technical_indicators.summary(),
-            "confidence": snapshot.technical_indicators.confidence,
-            "raw": asdict(snapshot.technical_indicators),
-        },
-        "summarize_news_urls": lambda: {
-            "items": [
-                {
-                    "title": item.get("title"),
-                    "source": item.get("source"),
-                    "url": item.get("url"),
-                }
-                for item in snapshot.news[:3]
-            ]
-        },
+        "explain_technical_signals": lambda: _technical_signal_payload(snapshot),
+        "summarize_news_urls": lambda: _news_urls_payload(snapshot),
         "read_news_url": lambda call=None: read_news_url_content(str((call or {}).get("args", {}).get("url", ""))),
     }
     if news_provider is not None:
@@ -93,25 +80,12 @@ def langchain_market_context_tools(snapshot: MarketSnapshot, recent_entries: lis
     @tool
     def explain_technical_signals() -> dict:
         """Explain RSI, MACD, SMA and technical confidence from validated indicators."""
-        return {
-            "summary": snapshot.technical_indicators.summary(),
-            "confidence": snapshot.technical_indicators.confidence,
-            "raw": asdict(snapshot.technical_indicators),
-        }
+        return _technical_signal_payload(snapshot)
 
     @tool
     def summarize_news_urls() -> dict:
         """List available news titles, sources and URLs from the Scout snapshot."""
-        return {
-            "items": [
-                {
-                    "title": item.get("title"),
-                    "source": item.get("source"),
-                    "url": item.get("url"),
-                }
-                for item in snapshot.news[:3]
-            ]
-        }
+        return _news_urls_payload(snapshot)
 
     @tool
     def read_news_url(url: str) -> dict:
@@ -211,6 +185,27 @@ def snapshot_payload(snapshot: MarketSnapshot) -> dict[str, Any]:
         "technical_indicators": asdict(snapshot.technical_indicators),
         "failures": snapshot.failures,
         "guardrails": snapshot.guardrails_triggered,
+    }
+
+
+def _technical_signal_payload(snapshot: MarketSnapshot) -> dict[str, Any]:
+    return {
+        "summary": snapshot.technical_indicators.summary(),
+        "confidence": snapshot.technical_indicators.confidence,
+        "raw": asdict(snapshot.technical_indicators),
+    }
+
+
+def _news_urls_payload(snapshot: MarketSnapshot) -> dict[str, Any]:
+    return {
+        "items": [
+            {
+                "title": item.get("title"),
+                "source": item.get("source"),
+                "url": item.get("url"),
+            }
+            for item in snapshot.news[:3]
+        ]
     }
 
 
