@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from trading_agent.core.data_hygiene import clean_text
+from trading_agent.adapters.ticker_provider import TickerProvider
 
 _SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}\b")
 _ALIASES = {
@@ -39,7 +40,7 @@ def parse_watchlist(value: str | list[str] | tuple[str, ...]) -> list[str]:
     return symbols
 
 
-def select_ticker(
+def select_ticker_v0(
     watchlist: list[str],
     *,
     human_input: list[str],
@@ -110,3 +111,36 @@ def _position_for(ticker: str, portfolio: dict[str, Any] | None) -> dict[str, An
             if isinstance(item, dict) and str(item.get("symbol", "")).upper() == ticker:
                 return item
     return None
+
+
+
+def select_ticker(
+    watchlist: str,
+    *,
+    human_input: list[str],
+    portfolio: dict[str, Any] | None,
+    cycle_index: int,
+    fallback: str | None = None,
+) -> TickerSelection:
+    
+    ticker_provider: TickerProvider = TickerProvider()
+
+    tickers_list = ticker_provider.get_tickers_with_info(watchlist)
+
+    mentioned = _mentioned_tickers(human_input, [ t.name for t in tickers_list])
+    if mentioned:
+        ticker = mentioned[-1]
+        return TickerSelection(
+            ticker=ticker,
+            reason="human_input",
+            rationale=_selection_rationale(ticker, "Human input mentioned this ticker.", human_input, portfolio),
+            mentioned_tickers=mentioned,
+        )
+    
+    ticker = tickers_list[0]
+    return TickerSelection(
+        ticker=ticker,
+        reason="most_valuable_by_metrics",
+        rationale=_selection_rationale(ticker, "Metrics used suggest this ticker as the most valuable.", human_input, portfolio),
+        mentioned_tickers=[],
+    )
