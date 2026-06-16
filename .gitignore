@@ -2,3 +2,4 @@ uv.lock
 venv/
 __pycache__/
 .env
+journal_runs/
