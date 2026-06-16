@@ -14,7 +14,7 @@ def assess_risk(
     """Apply deterministic tradeability and sizing constraints before the LLM decides."""
     sizing = build_position_sizing_context(snapshot, portfolio, risk_policy)
     portfolio_context = sizing["portfolio_context"]
-    reasons = [sizing["risk_explanation"], portfolio_context]
+    reasons = [sizing["risk_explanation"], portfolio_context, *sizing["risk_flags"]]
     hold_reasons = force_hold_reasons(snapshot.price_confidence, snapshot.guardrails_triggered)
     if hold_reasons:
         reason = "; ".join(hold_reasons)
@@ -25,6 +25,10 @@ def assess_risk(
             reasons=[*reasons, *hold_reasons],
             blocked_reason=reason,
             portfolio_context=portfolio_context,
+            max_buy_quantity=int(sizing["max_buy_quantity"]),
+            max_sell_quantity=int(sizing["max_sell_quantity"]),
+            stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
+            risk_flags=list(sizing["risk_flags"]),
         )
 
     max_quantity = int(sizing["max_quantity"])
@@ -36,6 +40,10 @@ def assess_risk(
             reasons=[*reasons, "risk policy allows no quantity"],
             blocked_reason="risk policy allows no quantity",
             portfolio_context=portfolio_context,
+            max_buy_quantity=0,
+            max_sell_quantity=0,
+            stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
+            risk_flags=list(sizing["risk_flags"]),
         )
 
     assessment = RiskAssessment(
@@ -44,6 +52,16 @@ def assess_risk(
         reasons=reasons,
         blocked_reason=None,
         portfolio_context=portfolio_context,
+        max_buy_quantity=int(sizing["max_buy_quantity"]),
+        max_sell_quantity=int(sizing["max_sell_quantity"]),
+        stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
+        risk_flags=list(sizing["risk_flags"]),
     )
-    logger.info("risk.ok ticker=%s max_quantity=%s", snapshot.ticker, max_quantity)
+    logger.info(
+        "risk.ok ticker=%s max_buy=%s max_sell=%s stop_loss=%s",
+        snapshot.ticker,
+        assessment.max_buy_quantity,
+        assessment.max_sell_quantity,
+        assessment.stop_loss_triggered,
+    )
     return assessment
