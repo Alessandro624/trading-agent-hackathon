@@ -30,7 +30,7 @@ logger = get_logger("analyst.react")
 
 TOOL_PROMPT = """You are the ReAct Analyst tool-selection step.
 Use the available tools only to inspect validated market data, news, technical context, or journal memory before the final decision.
-Do not place orders and do not decide BUY/SELL/HOLD in this step.
+Do not place orders and do not decide BUY/SELL/HOLD/WAIT in this step.
 Prefer no extra tool when the snapshot is already sufficient.
 Call search_market_news only when snapshot news is empty, stale, or too generic.
 Call read_news_url for at most one important URL when you need more than NewsAPI's truncated preview.
@@ -41,16 +41,17 @@ If the runtime requires a JSON tool plan, return exactly:
 
 FINAL_PROMPT = """You are the ReAct Analyst final decision step.
 Use the tool observations and return only valid JSON matching:
-{"action":"BUY|SELL|HOLD","quantity":0,"confidence":0.0,"rationale":"...","used_data_sources":["..."],"rationale_details":{"summary":"...","evidence":["..."],"risks":["..."],"data_quality":"..."}}
+{"action":"BUY|SELL|HOLD|WAIT","quantity":0,"confidence":0.0,"rationale":"...","used_data_sources":["..."],"rationale_details":{"summary":"...","evidence":["..."],"risks":["..."],"data_quality":"..."}}
 Do not invent prices, news, technical indicators, failures, guardrails, or portfolio state.
 Human input is advisory but important: consider it explicitly, and if you disagree, explain why using validated data and risk limits.
-If observations reveal missing/degraded data or contradictions, choose HOLD.
+If observations reveal a temporary data gap, pending market condition, or specific news/source that should be checked in a later cycle, choose WAIT.
+If observations reveal a final no-trade conclusion, contradiction, or unsafe setup, choose HOLD.
 NewsAPI content is a short/truncated preview; treat full article body as available only when read_news_url succeeded.
 If tool failures exist, mention them as data limits, not market signals.
-Quantity rule is strict: BUY/SELL require quantity > 0. HOLD requires quantity 0.
+Quantity rule is strict: BUY/SELL require quantity > 0. HOLD/WAIT require quantity 0.
 Use position_sizing.valid_quantity_rule.
-If the selected action limit is 0, choose HOLD with quantity 0.
-If position_sizing.stop_loss_triggered is true, treat it as a strong risk signal and explain whether to SELL or HOLD.
+If the selected action limit is 0, choose HOLD or WAIT with quantity 0.
+If position_sizing.stop_loss_triggered or position_sizing.take_profit_triggered is true, treat it as a strong risk signal and explain whether to SELL or HOLD.
 Consider position_sizing.current_position and portfolio_context before adding exposure or deciding to SELL.
 Write the rationale for humans reading a dashboard: concise summary, concrete evidence, explicit risks, and data-quality limits.
 """
@@ -230,12 +231,6 @@ def _with_tool_audit(details: dict[str, Any], observations: list[dict[str, Any]]
     enriched = dict(details or {})
     enriched["tool_audit"] = {
         "tools_used": [item.get("tool") for item in observations if item.get("tool")],
-        "tool_failures": [
-            item
-            for item in observations
-            if item.get("error") or ((item.get("observation") or {}).get("status") == "failed")
-        ],
+        "tool_failures": [item for item in observations if item.get("error") or ((item.get("observation") or {}).get("status") == "failed")],
     }
     return enriched
-
-

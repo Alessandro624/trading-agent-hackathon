@@ -21,7 +21,7 @@ Return only JSON matching:
 Use HOLD if the draft ignores missing data, portfolio constraints, or confidence.
 Important: LLM provider fallback, missing OPENAI_API_KEY, or use of Ollama is NOT missing market data and is NOT by itself a reason to HOLD.
 Evaluate only validated market data, technical/news confidence, guardrails, failures, quantity/risk consistency, and rationale coherence.
-Do not override merely because the draft is BUY or SELL. Override only for incoherence, missing critical data, low confidence, invalid quantity, or risk mismatch.
+Do not override merely because the draft is BUY, SELL, or WAIT. Override only for incoherence, missing critical data, low confidence, invalid quantity, or risk mismatch.
 """
 
 

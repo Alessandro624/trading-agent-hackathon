@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from trading_agent.core.data_hygiene import clean_text
+from trading_agent.core.portfolio import position_for
 from trading_agent.adapters.ticker_provider import TickerProvider
 
 _SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}\b")
@@ -91,28 +92,12 @@ def _selection_rationale(
     human_input: list[str],
     portfolio: dict[str, Any] | None,
 ) -> str:
-    position = _position_for(ticker, portfolio)
+    position = position_for(portfolio, ticker)
     position_text = "no current position"
     if position:
         position_text = f"current position qty={position.get('qty', 0)} market_value={position.get('market_value', 0)}"
     input_text = "; ".join(human_input) if human_input else "no new human input"
     return f"{reason} Selected {ticker}; {position_text}; human_input={input_text}"
-
-
-def _position_for(ticker: str, portfolio: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not portfolio:
-        return None
-    positions = portfolio.get("positions") or []
-    if isinstance(positions, dict):
-        payload = positions.get(ticker)
-        return payload if isinstance(payload, dict) else None
-    if isinstance(positions, list):
-        for item in positions:
-            if isinstance(item, dict) and str(item.get("symbol", "")).upper() == ticker:
-                return item
-    return None
-
-
 
 def select_ticker(
     watchlist: str,

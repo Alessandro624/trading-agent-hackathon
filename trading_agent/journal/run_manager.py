@@ -32,6 +32,7 @@ def create_run_context(base_dir: Path, ticker: str, resume_from: Path | None = N
         copyfile(context.resumed_from, context.journal_path)
         _copy_resume_sidecar(context.resumed_from.parent, context.run_dir, "human_input.md")
         _copy_resume_sidecar(context.resumed_from.parent, context.run_dir, "human_input.cursor")
+    _ensure_human_input_sidecars(context)
     return context
 
 
@@ -66,6 +67,13 @@ def _copy_resume_sidecar(previous_run_dir: Path, run_dir: Path, name: str) -> No
     source = previous_run_dir / name
     if source.exists():
         copyfile(source, run_dir / name)
+
+
+def _ensure_human_input_sidecars(context: RunContext) -> None:
+    if not context.human_input_path.exists():
+        context.human_input_path.write_text("", encoding="utf-8")
+    if not context.human_input_cursor_path.exists():
+        context.human_input_cursor_path.write_text("0", encoding="utf-8")
 
 
 def _unique_run_dir(candidate: Path) -> Path:

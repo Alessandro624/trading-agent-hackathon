@@ -14,7 +14,7 @@ from trading_agent.adapters import AlpacaBrokerClient, AlpacaMarketDataProvider,
 from trading_agent.core import HumanInputStore, parse_watchlist, select_ticker
 from trading_agent.journal import JournalStore, RunContext, create_run_context, print_cycle_log, render_dashboard
 from trading_agent.pipeline import build_graph, run_cycle
-from trading_agent.utils import FallbackLlmClient, OllamaJsonClient, OpenAiJsonClient, configure_logging
+from trading_agent.utils import FallbackLlmClient, OllamaJsonClient, OpenAiJsonClient, configure_logging, safe_portfolio_snapshot
 
 
 def _build_adapters():
@@ -57,7 +57,7 @@ def run_agent(
             selection = select_ticker(
                 watchlist_symbols,
                 human_input=human_notes,
-                portfolio=_safe_portfolio_for_selection(broker),
+                portfolio=safe_portfolio_snapshot(broker),
                 cycle_index=cycle_index,
                 fallback=ticker,
             )
@@ -88,14 +88,6 @@ def run_agent(
         if cycle_index < cycles - 1 and interval_seconds > 0:
             time.sleep(interval_seconds)
     return context
-
-
-def _safe_portfolio_for_selection(broker) -> dict:
-    try:
-        return broker.get_portfolio()
-    except Exception as error:
-        return {"portfolio_error": str(error)}
-
 
 def main() -> None:
     load_dotenv()

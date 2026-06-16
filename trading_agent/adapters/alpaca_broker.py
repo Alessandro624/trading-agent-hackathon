@@ -33,6 +33,15 @@ class AlpacaBrokerClient:
             ],
         }
 
+    def get_market_clock(self) -> dict:
+        clock = self.client.get_clock()
+        return {
+            "is_open": bool(clock.is_open),
+            "timestamp": _iso_or_none(getattr(clock, "timestamp", None)),
+            "next_open": _iso_or_none(getattr(clock, "next_open", None)),
+            "next_close": _iso_or_none(getattr(clock, "next_close", None)),
+        }
+
     def place_order(self, ticker: str, action: str, quantity: int) -> dict:
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
@@ -59,3 +68,12 @@ class AlpacaBrokerClient:
 
 def _status_value(status) -> str:
     return str(getattr(status, "value", status)).lower()
+
+
+def _iso_or_none(value) -> str | None:
+    if value is None:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        return isoformat()
+    return str(value)

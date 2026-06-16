@@ -4,6 +4,9 @@ import os
 from time import sleep
 
 from trading_agent.core import BrokerClient, ExecutionResult, RetryPolicy, RiskPolicy, TradingDecision
+from trading_agent.core.actions import is_passive_action
+from trading_agent.core.portfolio import cash as portfolio_cash
+from trading_agent.core.portfolio import float_or_none
 from trading_agent.utils import get_logger, safe_portfolio_snapshot
 
 logger = get_logger("executor")
@@ -23,15 +26,17 @@ def execute_decision(
     fill_poll_attempts = fill_poll_attempts if fill_poll_attempts is not None else int(os.getenv("BROKER_FILL_POLL_ATTEMPTS", "5"))
     fill_poll_seconds = fill_poll_seconds if fill_poll_seconds is not None else float(os.getenv("BROKER_FILL_POLL_SECONDS", "2"))
     logger.info("executor.start ticker=%s action=%s quantity=%s", decision.ticker, decision.action, decision.quantity)
-    if decision.action == "HOLD":
+    if is_passive_action(decision.action):
         portfolio = safe_portfolio_snapshot(broker)
-        logger.info("executor.result ticker=%s status=skipped reason=hold", decision.ticker)
+        status = "waiting" if decision.action == "WAIT" else "skipped"
+        reason = "wait" if decision.action == "WAIT" else "hold"
+        logger.info("executor.result ticker=%s status=%s reason=%s", decision.ticker, status, reason)
         return ExecutionResult(
             decision.ticker,
             decision.action,
-            "skipped",
+            status,
             None,
-            "HOLD decision, no order sent.",
+            f"{decision.action} decision, no order sent.",
             portfolio,
             portfolio_before=portfolio,
             requested_quantity=decision.quantity,
@@ -40,8 +45,8 @@ def execute_decision(
 
     try:
         portfolio_before = broker.get_portfolio()
-        cash = float(portfolio_before.get("cash", 0))
-        portfolio_value = _safe_float(portfolio_before.get("portfolio_value"))
+        cash = portfolio_cash(portfolio_before) or 0.0
+        portfolio_value = float_or_none(portfolio_before.get("portfolio_value"))
         allowed_quantity = risk_policy.max_quantity_for_action(
             action=decision.action,
             ticker=decision.ticker,
@@ -118,7 +123,7 @@ def execute_decision(
         order = retry_policy.run(place)
         order = _wait_for_order_update(broker, order, fill_poll_attempts, fill_poll_seconds)
         order_status = _status_text(order.get("status", "unknown"))
-        filled_avg_price = _safe_float(order.get("filled_avg_price"))
+        filled_avg_price = float_or_none(order.get("filled_avg_price"))
         portfolio_after = safe_portfolio_snapshot(broker)
         if "portfolio_error" in portfolio_after:
             logger.warning("executor.portfolio_after.fail ticker=%s error=%s", decision.ticker, portfolio_after["portfolio_error"])
@@ -217,10 +222,3 @@ def _blocked_execution_result(
 def _status_text(value) -> str:
     text = str(getattr(value, "value", value)).lower()
     return text.rsplit(".", 1)[-1]
-
-
-def _safe_float(value) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None

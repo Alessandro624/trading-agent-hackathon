@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from trading_agent.core import BrokerClient, LlmClient, MarketDataProvider, NewsProvider, utc_now_iso
+from trading_agent.core import BrokerClient, LlmClient, MarketDataProvider, NewsProvider, TradingDecision, is_trade_action, utc_now_iso
 from trading_agent.journal import JournalStore
 from trading_agent.agents import (
     assess_risk,
@@ -314,13 +314,68 @@ def _risk_analysis(state: State, broker: BrokerClient) -> State:
 
 
 def _execute_with_price(state: State, market_data: MarketDataProvider, broker: BrokerClient) -> State:
-    order_price = _current_order_price(market_data, state["ticker"], state["snapshot"].price)
+    if _defer_trade_if_market_closed(state, broker):
+        order_price = state["snapshot"].price
+    else:
+        order_price = _current_order_price(market_data, state["ticker"], state["snapshot"].price)
     state["execution_result"] = execute_decision(
         state["final_decision"],
         broker,
         estimated_price=order_price,
     )
     return state
+
+
+def _defer_trade_if_market_closed(state: State, broker: BrokerClient) -> bool:
+    decision = state.get("final_decision")
+    if decision is None or not is_trade_action(decision.action):
+        return False
+
+    get_market_clock = getattr(broker, "get_market_clock", None)
+    if not callable(get_market_clock):
+        return False
+
+    try:
+        clock = get_market_clock()
+    except Exception as error:
+        logger.warning("market.clock.fail ticker=%s error=%s", decision.ticker, error)
+        return False
+
+    state["market_clock"] = clock
+    if clock.get("is_open") is not False:
+        logger.info("market.clock.open ticker=%s", decision.ticker)
+        return False
+
+    next_open = clock.get("next_open") or "unknown"
+    original = f"{decision.action} qty {decision.quantity}"
+    logger.info("market.clock.closed ticker=%s next_open=%s original=%s", decision.ticker, next_open, original)
+    state["final_decision"] = TradingDecision(
+        ticker=decision.ticker,
+        action="WAIT",
+        quantity=0,
+        confidence=min(decision.confidence, 0.6),
+        rationale=(
+            f"Market is closed according to broker clock; WAIT until next_open={next_open}. "
+            f"Original decision was {original}: {decision.rationale}"
+        ),
+        used_data_sources=[*decision.used_data_sources, "broker_clock"],
+        guardrails_triggered=[*decision.guardrails_triggered, "guardrail:market_closed_wait"],
+        reflection=_merge_market_clock_reflection(decision.reflection, clock),
+        llm_metadata=decision.llm_metadata,
+        rationale_details={
+            **(decision.rationale_details or {}),
+            "market_clock": clock,
+            "summary": f"Trade deferred because market is closed; next_open={next_open}.",
+        },
+    )
+    return True
+
+
+def _merge_market_clock_reflection(existing: str | None, clock: dict) -> str:
+    message = f"Market clock closed; next_open={clock.get('next_open') or 'unknown'}."
+    if not existing:
+        return message
+    return f"{existing}. {message}"
 
 
 def _portfolio_for_sizing(broker: BrokerClient, ticker: str) -> dict | None:

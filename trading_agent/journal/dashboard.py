@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from trading_agent.core.portfolio import float_or_none, normalize_positions
+
 
 def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     rows = _read_rows(journal_path)
@@ -32,6 +34,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
       --buy: #147d4f;
       --sell: #b42318;
       --hold: #667085;
+      --wait: #1769aa;
       --warn: #b54708;
       --fail: #b42318;
       --shadow: 0 10px 24px rgba(16, 24, 40, .06);
@@ -176,6 +179,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     .BUY {{ background: var(--buy); }}
     .SELL {{ background: var(--sell); }}
     .HOLD {{ background: var(--hold); }}
+    .WAIT {{ background: var(--wait); }}
     .guardrail {{ color: var(--warn); font-weight: 700; font-size: 12px; }}
     .failed {{ color: var(--fail); font-weight: 700; }}
     .muted {{ color: var(--muted); }}
@@ -386,7 +390,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     <section class="grid" aria-label="Run metrics">
       <div class="metric"><span>Total cycles</span><strong>{stats["cycle_count"]}</strong></div>
       <div class="metric"><span>Progress events</span><strong>{stats["stage_count"]}</strong></div>
-      <div class="metric"><span>Actions</span><strong class="split"><b>BUY {stats["actions"].get("BUY", 0)}</b><b>SELL {stats["actions"].get("SELL", 0)}</b><b>HOLD {stats["actions"].get("HOLD", 0)}</b></strong></div>
+      <div class="metric"><span>Actions</span><strong class="split"><b>BUY {stats["actions"].get("BUY", 0)}</b><b>SELL {stats["actions"].get("SELL", 0)}</b><b>HOLD {stats["actions"].get("HOLD", 0)}</b><b>WAIT {stats["actions"].get("WAIT", 0)}</b></strong></div>
       <div class="metric"><span>Guardrails</span><strong>{stats["guardrails"]}</strong></div>
       <div class="metric"><span>Failures / retries</span><strong>{stats["failures"]} / {stats["retries"]}</strong></div>
     </section>
@@ -500,7 +504,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
       if (!emptyState) return;
       const messages = {{
         all: ["No journal entries", "Run the agent to create the first cycle."],
-        trades: ["No BUY or SELL cycles", "The agent only held or no trade was attempted."],
+        trades: ["No BUY or SELL cycles", "The agent only held, waited, or no trade was attempted."],
         failed: ["No failed cycles", "All visible cycles completed without a failed execution."],
         guardrails: ["No guardrails triggered", "No data quality or safety guardrails fired in this run."]
       }};
@@ -798,6 +802,8 @@ def _outcome_badge_html(row: dict[str, Any]) -> str:
     status = str(execution.get("status", row.get("outcome", ""))).lower()
     if status in {"filled", "skipped"}:
         return '<span class="outcome-badge success">Success</span>'
+    if status == "waiting":
+        return '<span class="outcome-badge neutral">Waiting</span>'
     if status == "submitted":
         return '<span class="outcome-badge neutral">Submitted</span>'
     if status in {"blocked", "rejected", "failed"}:
@@ -958,7 +964,7 @@ def _portfolio_markdown(row: dict[str, Any]) -> str:
         f"- portfolio_value_after: {_format_money(value) if value is not None else 'unknown'}",
         f"- portfolio_value_delta: {_format_signed_money(value_delta) if value_delta is not None else 'unknown'}",
     ]
-    normalized = _normalize_positions(positions)
+    normalized = normalize_positions(positions)
     if not normalized:
         lines.append("- positions: none")
     else:
@@ -1001,30 +1007,11 @@ def _current_portfolio(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def _positions_count(positions: Any) -> int:
-    return len(_normalize_positions(positions))
-
-
-def _normalize_positions(positions: Any) -> dict[str, dict[str, Any]]:
-    if isinstance(positions, dict):
-        normalized: dict[str, dict[str, Any]] = {}
-        for symbol, payload in positions.items():
-            normalized[str(symbol)] = payload if isinstance(payload, dict) else {"qty": payload}
-        return normalized
-    if isinstance(positions, list):
-        normalized = {}
-        for item in positions:
-            if isinstance(item, dict):
-                symbol = str(item.get("symbol", "UNKNOWN"))
-                normalized[symbol] = item
-        return normalized
-    return {}
+    return len(normalize_positions(positions))
 
 
 def _safe_float(value: Any) -> float | None:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return float_or_none(value)
 
 
 def _format_money(value: float | None) -> str:

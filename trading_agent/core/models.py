@@ -4,9 +4,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from trading_agent.core.actions import Action, normalize_quantity_for_action, validate_action
 from trading_agent.core.data_hygiene import clean_news_items
 
-Action = Literal["BUY", "SELL", "HOLD"]
 ConfidenceLabel = Literal["high", "medium", "low", "none"]
 Sentiment = Literal["positive", "negative", "neutral", "mixed", "unknown"]
 Trend = Literal["bullish", "bearish", "neutral"]
@@ -150,6 +150,7 @@ class RiskAssessment:
     max_buy_quantity: int = 0
     max_sell_quantity: int = 0
     stop_loss_triggered: bool = False
+    take_profit_triggered: bool = False
     risk_flags: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -166,6 +167,8 @@ class RiskAssessment:
             raise ValueError("blocked risk assessment must include blocked_reason")
         if not isinstance(self.portfolio_context, str):
             raise ValueError("risk portfolio_context must be a string")
+        if not isinstance(self.take_profit_triggered, bool):
+            raise ValueError("risk take_profit_triggered must be a bool")
         if not isinstance(self.risk_flags, list):
             raise ValueError("risk_flags must be a list")
 
@@ -188,14 +191,12 @@ class TradingDecision:
 
     def validate(self) -> None:
         self.ticker = self.ticker.upper()
-        if self.action not in {"BUY", "SELL", "HOLD"}:
-            raise ValueError("action must be BUY, SELL, or HOLD")
+        validate_action(self.action)
         if self.quantity < 0:
             raise ValueError("quantity must be >= 0")
         if not 0 <= self.confidence <= 1:
             raise ValueError("confidence must be between 0 and 1")
-        if self.action == "HOLD" and self.quantity != 0:
-            self.quantity = 0
+        self.quantity = normalize_quantity_for_action(self.action, self.quantity)
         if not self.rationale:
             raise ValueError("rationale must not be empty")
         if not isinstance(self.used_data_sources, list):
@@ -210,7 +211,7 @@ class TradingDecision:
 class ExecutionResult:
     ticker: str
     attempted_action: Action
-    status: Literal["skipped", "submitted", "filled", "blocked", "rejected", "failed"]
+    status: Literal["skipped", "waiting", "submitted", "filled", "blocked", "rejected", "failed"]
     order_id: str | None
     message: str
     portfolio_after: dict[str, Any]
@@ -227,9 +228,8 @@ class ExecutionResult:
 
     def validate(self) -> None:
         self.ticker = self.ticker.upper()
-        if self.attempted_action not in {"BUY", "SELL", "HOLD"}:
-            raise ValueError("attempted_action must be BUY, SELL, or HOLD")
-        if self.status not in {"skipped", "submitted", "filled", "blocked", "rejected", "failed"}:
+        validate_action(self.attempted_action, label="attempted_action")
+        if self.status not in {"skipped", "waiting", "submitted", "filled", "blocked", "rejected", "failed"}:
             raise ValueError("invalid execution status")
         if not isinstance(self.portfolio_after, dict):
             raise ValueError("portfolio_after must be a dict")
@@ -279,8 +279,7 @@ class JournalEntry:
         self.ticker = self.ticker.upper()
         if self.entry_type != "cycle":
             raise ValueError("journal entry_type must be cycle")
-        if self.action not in {"BUY", "SELL", "HOLD"}:
-            raise ValueError("journal action must be BUY, SELL, or HOLD")
+        validate_action(self.action, label="journal action")
         if not 0 <= self.confidence <= 1:
             raise ValueError("journal confidence must be between 0 and 1")
         if not self.timestamp:
