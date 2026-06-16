@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from trading_agent.core import BrokerClient, LlmClient, MarketDataProvider, NewsProvider
+from trading_agent.core import BrokerClient, LlmClient, MarketDataProvider, NewsProvider, utc_now_iso
 from trading_agent.journal import JournalStore
 from trading_agent.agents import (
     assess_risk,
@@ -30,6 +30,8 @@ class State(TypedDict, total=False):
     final_decision: Any
     execution_result: Any
     journal_entry: Any
+    cycle_started_at: str
+    human_input: list[str]
 
 
 def build_graph(
@@ -56,18 +58,15 @@ def build_single_agent_graph(
 ):
     END, StateGraph = _load_langgraph()
     graph = StateGraph(State)
-    _add_scout_node(graph, market_data, news_provider)
+    _add_scout_node(graph, market_data, news_provider, journal)
 
     def analyst_node(state: State) -> State:
-        portfolio = _portfolio_for_sizing(broker, state["ticker"])
-        state["draft_decision"] = react_analyst_decision(
-            state["snapshot"],
-            state.get("recent_entries", []),
-            llm_client,
-            portfolio=portfolio,
-            news_provider=news_provider,
+        return _run_stage(
+            state,
+            journal,
+            "analyst",
+            lambda: _single_agent_analysis(state, broker, llm_client, news_provider),
         )
-        return state
 
     graph.add_node("analyst", analyst_node)
     _add_common_tail_nodes(graph, market_data, llm_client, broker, journal)
@@ -89,36 +88,52 @@ def build_multi_agent_graph(
 ):
     END, StateGraph = _load_langgraph()
     graph = StateGraph(State)
-    _add_scout_node(graph, market_data, news_provider)
+    _add_scout_node(graph, market_data, news_provider, journal)
 
     def technical_node(state: State) -> State:
-        state["technical_opinion"] = technical_opinion(state["snapshot"])
-        return state
+        return _run_stage(state, journal, "technical_analyst", lambda: state.update({"technical_opinion": technical_opinion(state["snapshot"])}) or state)
 
     def news_node(state: State) -> State:
-        state["news_opinion"] = news_opinion(
-            state["snapshot"],
-            state.get("recent_entries", []),
-            llm_client,
-            news_provider,
+        return _run_stage(
+            state,
+            journal,
+            "news_analyst",
+            lambda: state.update(
+                {
+                    "news_opinion": news_opinion(
+                        state["snapshot"],
+                        state.get("recent_entries", []),
+                        llm_client,
+                        news_provider,
+                    )
+                }
+            )
+            or state,
         )
-        return state
 
     def risk_node(state: State) -> State:
-        portfolio = _portfolio_for_sizing(broker, state["ticker"])
-        state["risk_assessment"] = assess_risk(state["snapshot"], portfolio)
-        return state
+        return _run_stage(state, journal, "risk_manager", lambda: _risk_analysis(state, broker))
 
     def decision_node(state: State) -> State:
-        state["draft_decision"] = decide_from_opinions(
-            state["snapshot"],
-            state.get("recent_entries", []),
-            state["technical_opinion"],
-            state["news_opinion"],
-            state["risk_assessment"],
-            llm_client,
+        return _run_stage(
+            state,
+            journal,
+            "decision_manager",
+            lambda: state.update(
+                {
+                    "draft_decision": decide_from_opinions(
+                        state["snapshot"],
+                        state.get("recent_entries", []),
+                        state["technical_opinion"],
+                        state["news_opinion"],
+                        state["risk_assessment"],
+                        llm_client,
+                        human_input=state.get("human_input", []),
+                    )
+                }
+            )
+            or state,
         )
-        return state
 
     graph.add_node("technical_analyst", technical_node)
     graph.add_node("news_analyst", news_node)
@@ -137,10 +152,19 @@ def build_multi_agent_graph(
     return graph.compile()
 
 
-def _add_scout_node(graph, market_data: MarketDataProvider, news_provider: NewsProvider) -> None:
+def _add_scout_node(
+    graph,
+    market_data: MarketDataProvider,
+    news_provider: NewsProvider,
+    journal: JournalStore,
+) -> None:
     def scout_node(state: State) -> State:
-        state["snapshot"] = scout_snapshot(state["ticker"], market_data, news_provider)
-        return state
+        return _run_stage(
+            state,
+            journal,
+            "scout",
+            lambda: state.update({"snapshot": scout_snapshot(state["ticker"], market_data, news_provider)}) or state,
+        )
 
     graph.add_node("scout", scout_node)
 
@@ -153,26 +177,41 @@ def _add_common_tail_nodes(
     journal: JournalStore,
 ) -> None:
     def reflection_node(state: State) -> State:
-        state["final_decision"] = reflect_decision(state["snapshot"], state["draft_decision"], llm_client)
-        return state
+        return _run_stage(
+            state,
+            journal,
+            "reflection",
+            lambda: state.update({"final_decision": reflect_decision(state["snapshot"], state["draft_decision"], llm_client)})
+            or state,
+        )
 
     def executor_node(state: State) -> State:
-        order_price = _current_order_price(market_data, state["ticker"], state["snapshot"].price)
-        state["execution_result"] = execute_decision(
-            state["final_decision"],
-            broker,
-            estimated_price=order_price,
+        return _run_stage(
+            state,
+            journal,
+            "executor",
+            lambda: _execute_with_price(state, market_data, broker),
         )
-        return state
 
     def journal_node(state: State) -> State:
-        state["journal_entry"] = journal.append(
-            state["snapshot"],
-            state["final_decision"],
-            state["execution_result"],
-            draft_decision=state.get("draft_decision"),
+        return _run_stage(
+            state,
+            journal,
+            "journal",
+            lambda: state.update(
+                {
+                    "journal_entry": journal.append(
+                        state["snapshot"],
+                        state["final_decision"],
+                        state["execution_result"],
+                        draft_decision=state.get("draft_decision"),
+                        cycle_started_at=state.get("cycle_started_at"),
+                        human_input=state.get("human_input", []),
+                    )
+                }
+            )
+            or state,
         )
-        return state
 
     graph.add_node("reflection", reflection_node)
     graph.add_node("executor", executor_node)
@@ -183,14 +222,104 @@ def run_cycle(
     agent,
     ticker: str,
     recent_entries: list,
+    journal: JournalStore | None = None,
+    cycle_started_at: str | None = None,
+    human_input: list[str] | None = None,
 ) -> State:
     symbol = ticker.upper()
-    logger.info("cycle.start ticker=%s", symbol)
-    state = agent.invoke({"ticker": symbol, "recent_entries": recent_entries})
+    started_at = cycle_started_at or utc_now_iso()
+    human_notes = human_input or []
+    logger.info("cycle.start ticker=%s started_at=%s", symbol, started_at)
+    if journal is not None:
+        journal.append_stage(
+            ticker=symbol,
+            stage="cycle",
+            status="started",
+            message="Cycle started.",
+            cycle_started_at=started_at,
+            details={"human_input": human_notes},
+        )
+    try:
+        state = agent.invoke(
+            {
+                "ticker": symbol,
+                "recent_entries": recent_entries,
+                "cycle_started_at": started_at,
+                "human_input": human_notes,
+            }
+        )
+    except Exception as error:
+        logger.error("cycle.failed ticker=%s error=%s", symbol, error)
+        if journal is not None:
+            journal.append_stage(
+                ticker=symbol,
+                stage="cycle",
+                status="failed",
+                message=str(error),
+                cycle_started_at=started_at,
+            )
+        raise
     entry = state.get("journal_entry")
     if entry:
         logger.info("journal.write ticker=%s outcome=%s", symbol, entry.outcome)
         logger.info("cycle.end ticker=%s action=%s outcome=%s", symbol, entry.action, entry.outcome)
+    return state
+
+
+def _run_stage(state: State, journal: JournalStore, stage: str, action) -> State:
+    ticker = state["ticker"]
+    started_at = state.get("cycle_started_at")
+    logger.info("cycle.stage.start ticker=%s stage=%s", ticker, stage)
+    journal.append_stage(ticker=ticker, stage=stage, status="started", message=f"{stage} started.", cycle_started_at=started_at)
+    try:
+        next_state = action()
+    except Exception as error:
+        logger.error("cycle.stage.failed ticker=%s stage=%s error=%s", ticker, stage, error)
+        journal.append_stage(ticker=ticker, stage=stage, status="failed", message=str(error), cycle_started_at=started_at)
+        raise
+    journal.append_stage(
+        ticker=ticker,
+        stage=stage,
+        status="completed",
+        message=f"{stage} completed.",
+        cycle_started_at=started_at,
+        snapshot=next_state.get("snapshot"),
+    )
+    logger.info("cycle.stage.completed ticker=%s stage=%s", ticker, stage)
+    return next_state
+
+
+def _single_agent_analysis(
+    state: State,
+    broker: BrokerClient,
+    llm_client: LlmClient,
+    news_provider: NewsProvider,
+) -> State:
+    portfolio = _portfolio_for_sizing(broker, state["ticker"])
+    state["draft_decision"] = react_analyst_decision(
+        state["snapshot"],
+        state.get("recent_entries", []),
+        llm_client,
+        portfolio=portfolio,
+        news_provider=news_provider,
+        human_input=state.get("human_input", []),
+    )
+    return state
+
+
+def _risk_analysis(state: State, broker: BrokerClient) -> State:
+    portfolio = _portfolio_for_sizing(broker, state["ticker"])
+    state["risk_assessment"] = assess_risk(state["snapshot"], portfolio)
+    return state
+
+
+def _execute_with_price(state: State, market_data: MarketDataProvider, broker: BrokerClient) -> State:
+    order_price = _current_order_price(market_data, state["ticker"], state["snapshot"].price)
+    state["execution_result"] = execute_decision(
+        state["final_decision"],
+        broker,
+        estimated_price=order_price,
+    )
     return state
 
 
