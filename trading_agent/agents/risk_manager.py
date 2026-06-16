@@ -61,7 +61,7 @@ def assess_risk(
         risk_flags=list(sizing["risk_flags"]),
     )
     logger.info(
-        "risk.ok ticker=%s max_buy=%s max_sell=%s stop_loss=%s",
+        "risk.ok ticker=%s max_buy=%s max_sell=%s stop_loss=%s take_profit=%s",
         snapshot.ticker,
         assessment.max_buy_quantity,
         assessment.max_sell_quantity,
