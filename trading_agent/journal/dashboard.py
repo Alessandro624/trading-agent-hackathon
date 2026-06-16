@@ -379,12 +379,13 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     <section class="summary" aria-label="Run summary">
       <div class="summary-item stat-card info"><span>Run summary</span><strong class="stat-value">{html.escape(stats["run_summary_short"])}</strong><small class="stat-sub">{html.escape(stats["run_summary_detail"])}</small></div>
       <div class="summary-item stat-card {stats["recovery_class"]}"><span>Recovery signal</span><strong class="stat-value">{stats["guardrails"]} guardrails, {stats["fallbacks"]} fallbacks</strong><small class="stat-sub">{stats["retries"]} retries recorded</small></div>
-      <div class="summary-item stat-card {stats["health_class"]}"><span>Execution health</span><strong class="stat-value">{stats["failures"]} failures</strong><small class="stat-sub">Across {len(rows)} cycles</small></div>
+      <div class="summary-item stat-card {stats["health_class"]}"><span>Execution health</span><strong class="stat-value">{stats["failures"]} failures</strong><small class="stat-sub">Across {stats["cycle_count"]} cycles</small></div>
       <div class="summary-item stat-card info"><span>Portfolio outcome</span><strong class="stat-value">{html.escape(stats["portfolio_outcome"])}</strong><small class="stat-sub">Latest snapshot</small></div>
       <div class="summary-item stat-card {stats["portfolio_class"]}"><span>Portfolio path</span><strong class="stat-value">{html.escape(stats["portfolio_path_short"])}</strong><small class="stat-sub">{html.escape(stats["portfolio_path_detail"])}</small></div>
     </section>
     <section class="grid" aria-label="Run metrics">
-      <div class="metric"><span>Total cycles</span><strong>{len(rows)}</strong></div>
+      <div class="metric"><span>Total cycles</span><strong>{stats["cycle_count"]}</strong></div>
+      <div class="metric"><span>Progress events</span><strong>{stats["stage_count"]}</strong></div>
       <div class="metric"><span>Actions</span><strong class="split"><b>BUY {stats["actions"].get("BUY", 0)}</b><b>SELL {stats["actions"].get("SELL", 0)}</b><b>HOLD {stats["actions"].get("HOLD", 0)}</b></strong></div>
       <div class="metric"><span>Guardrails</span><strong>{stats["guardrails"]}</strong></div>
       <div class="metric"><span>Failures / retries</span><strong>{stats["failures"]} / {stats["retries"]}</strong></div>
@@ -523,25 +524,33 @@ def _read_rows(journal_path: Path) -> list[dict[str, Any]]:
 
 
 def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    actions = Counter(row.get("action", "UNKNOWN") for row in rows)
+    cycle_rows = [row for row in rows if row.get("entry_type", "cycle") == "cycle"]
+    stage_rows = [row for row in rows if row.get("entry_type") == "stage"]
+    timeline_rows = cycle_rows or rows
+    actions = Counter(row.get("action", "UNKNOWN") for row in cycle_rows)
     tickers = sorted({row.get("ticker", "-") for row in rows})
-    timestamps = [row.get("timestamp") for row in rows if row.get("timestamp")]
-    guardrails = sum(len(row.get("guardrails_triggered") or []) for row in rows)
+    timestamps = [row.get("timestamp") for row in timeline_rows if row.get("timestamp")]
+    guardrails = sum(len(row.get("guardrails_triggered") or []) for row in cycle_rows)
     failures = sum(len(row.get("failures") or []) for row in rows)
-    retries = sum(_retry_count(row) for row in rows)
-    fallbacks = sum(1 for row in rows if row.get("llm_fallback_used"))
-    portfolio_outcome = _portfolio_outcome(rows)
-    portfolio_path = _portfolio_path(rows)
+    failures += sum(1 for row in stage_rows if row.get("status") == "failed")
+    retries = sum(_retry_count(row) for row in cycle_rows)
+    fallbacks = sum(1 for row in cycle_rows if row.get("llm_fallback_used"))
+    portfolio_outcome = _portfolio_outcome(cycle_rows)
+    portfolio_path = _portfolio_path(cycle_rows)
     if timestamps:
-        run_summary = f"{len(rows)} cycles from {_format_datetime(min(timestamps))} to {_format_datetime(max(timestamps))}"
-        run_summary_short = f"{len(rows)} cycles"
+        run_summary = f"{len(cycle_rows)} cycles from {_format_datetime(min(timestamps))} to {_format_datetime(max(timestamps))}"
+        run_summary_short = f"{len(cycle_rows)} cycles"
         run_summary_detail = f"{_format_datetime(min(timestamps))} to {_format_datetime(max(timestamps))}"
     else:
         run_summary = "No cycles recorded"
         run_summary_short = "No cycles"
         run_summary_detail = "-"
-    initial = _initial_portfolio(rows)
-    current = _current_portfolio(rows)
+    if not cycle_rows and stage_rows:
+        run_summary = f"No completed cycles; {len(stage_rows)} progress events recorded"
+        run_summary_short = "0 cycles"
+        run_summary_detail = f"{len(stage_rows)} progress events"
+    initial = _initial_portfolio(cycle_rows)
+    current = _current_portfolio(cycle_rows)
     initial_cash = _safe_float((initial or {}).get("cash"))
     current_cash = _safe_float((current or {}).get("cash"))
     initial_value = _safe_float((initial or {}).get("portfolio_value"))
@@ -550,6 +559,8 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     value_delta = None if initial_value is None or current_value is None else current_value - initial_value
     return {
         "actions": actions,
+        "cycle_count": len(cycle_rows),
+        "stage_count": len(stage_rows),
         "tickers": ", ".join(tickers) if tickers else "-",
         "run_summary": run_summary,
         "run_summary_short": run_summary_short,
