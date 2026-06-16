@@ -11,7 +11,7 @@ except ImportError:
         return None
 
 from trading_agent.adapters import AlpacaBrokerClient, AlpacaMarketDataProvider, NewsApiProvider
-from trading_agent.core import HumanInputStore, parse_watchlist, select_ticker
+from trading_agent.core import HumanInputStore, HumanInstruction, parse_watchlist, plan_human_instructions, select_ticker
 from trading_agent.journal import JournalStore, RunContext, create_run_context, print_cycle_log, render_dashboard
 from trading_agent.pipeline import build_graph, run_cycle
 from trading_agent.utils import FallbackLlmClient, OllamaJsonClient, OpenAiJsonClient, configure_logging, safe_portfolio_snapshot
@@ -37,7 +37,8 @@ def run_agent(
     configure_logging()
     context = create_run_context(base_dir, ticker, resume_from=resume_from)
     journal = JournalStore(context.journal_path)
-    human_input_store = HumanInputStore(human_input or context.human_input_path, context.human_input_cursor_path)
+    human_input_path = human_input or context.human_input_path
+    human_input_store = HumanInputStore(human_input_path, _human_input_cursor_path(human_input, context.human_input_cursor_path))
     market_data, news_provider, llm_client, broker = _build_adapters()
     recent_entries = journal.read_all()[-memory_limit:] if context.resumed_from else []
     watchlist_symbols = parse_watchlist(watchlist or ticker)
@@ -50,14 +51,48 @@ def run_agent(
         journal=journal,
     )
 
+    instruction_queue: list[HumanInstruction] = []
     for cycle_index in range(cycles):
-        human_notes = human_input_store.read_new_notes().notes
+        portfolio_snapshot = safe_portfolio_snapshot(broker)
+        if not instruction_queue:
+            instruction_queue.extend(
+                plan_human_instructions(
+                    human_input_store.read_next_note().notes,
+                    watchlist=watchlist_symbols,
+                    portfolio=portfolio_snapshot,
+                    fallback_ticker=ticker,
+                    llm_client=llm_client,
+                )
+            )
+        active_instruction = instruction_queue.pop(0) if instruction_queue else None
+        human_notes = [active_instruction.note] if active_instruction else []
         selected_ticker = ticker
-        if ticker_mode == "auto":
+        if active_instruction and active_instruction.target_ticker:
+            selected_ticker = active_instruction.target_ticker
+            journal.append_stage(
+                ticker=selected_ticker,
+                stage="ticker_selector",
+                status="completed",
+                message=f"Human instruction selected {selected_ticker}.",
+                details={
+                    "reason": active_instruction.reason,
+                    "watchlist": watchlist_symbols,
+                    "mentioned_tickers": [selected_ticker],
+                    "human_input": human_notes,
+                    "human_instruction_index": active_instruction.sequence_index,
+                    "human_instruction_total": active_instruction.sequence_total,
+                    "human_instruction_status": "active",
+                    "human_resolver_source": _human_resolver_source(active_instruction),
+                    "human_resolver_confidence": active_instruction.resolver_confidence,
+                    "human_resolver_rationale": active_instruction.resolver_rationale,
+                    "human_resolver_topic": active_instruction.resolver_topic,
+                },
+            )
+        elif ticker_mode == "auto":
             selection = select_ticker(
                 watchlist_symbols,
                 human_input=human_notes,
-                portfolio=safe_portfolio_snapshot(broker),
+                portfolio=portfolio_snapshot,
                 cycle_index=cycle_index,
                 fallback=ticker,
             )
@@ -88,6 +123,21 @@ def run_agent(
         if cycle_index < cycles - 1 and interval_seconds > 0:
             time.sleep(interval_seconds)
     return context
+
+
+def _human_input_cursor_path(human_input: Path | None, default_cursor: Path) -> Path:
+    if human_input is None:
+        return default_cursor
+    return human_input.with_suffix(".cursor")
+
+
+def _human_resolver_source(instruction: HumanInstruction) -> str:
+    if instruction.reason == "human_llm_position_sweep":
+        return "llm"
+    if instruction.reason == "human_position_sweep":
+        return "deterministic_fallback"
+    return "deterministic"
+
 
 def main() -> None:
     load_dotenv()

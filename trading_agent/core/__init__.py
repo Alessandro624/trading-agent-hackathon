@@ -11,6 +11,8 @@ from trading_agent.core.actions import (
 from trading_agent.core.confidence_policy import force_hold_reasons, news_confidence, price_confidence
 from trading_agent.core.data_hygiene import clean_news_article, clean_news_items, clean_text
 from trading_agent.core.human_input import HumanInputBatch, HumanInputStore
+from trading_agent.core.human_instruction import HumanInstruction, plan_human_instructions
+from trading_agent.core.human_intent import HumanIntent, parse_human_intent
 from trading_agent.core.llm_guardrails import (
     AnalystDecisionOutput,
     NewsOpinionOutput,
@@ -66,6 +68,8 @@ __all__ = [
     "JournalEntry",
     "HumanInputBatch",
     "HumanInputStore",
+    "HumanInstruction",
+    "HumanIntent",
     "LlmClient",
     "MarketSnapshot",
     "MarketDataProvider",
@@ -96,9 +100,11 @@ __all__ = [
     "normalize_positions",
     "normalize_quantity_for_action",
     "parse_analyst_output",
+    "parse_human_intent",
     "parse_news_opinion_output",
     "parse_reflection_output",
     "parse_watchlist",
+    "plan_human_instructions",
     "portfolio_value",
     "price_confidence",
     "position_for",

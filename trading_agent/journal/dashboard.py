@@ -12,9 +12,10 @@ from trading_agent.core.portfolio import float_or_none, normalize_positions
 
 def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     rows = _read_rows(journal_path)
+    display_rows = _cycle_rows(rows)
     stats = _stats(rows)
-    details_json = json.dumps([_details_payload(row) for row in rows], ensure_ascii=False)
-    table_rows = "\n".join(_render_row(index, row) for index, row in enumerate(rows))
+    details_json = json.dumps([_details_payload(row) for row in display_rows], ensure_ascii=False)
+    table_rows = "\n".join(_render_row(index, row) for index, row in enumerate(display_rows))
 
     document = f"""<!doctype html>
 <html lang="en">
@@ -527,8 +528,12 @@ def _read_rows(journal_path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
+def _cycle_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [row for row in rows if row.get("entry_type", "cycle") == "cycle"]
+
+
 def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    cycle_rows = [row for row in rows if row.get("entry_type", "cycle") == "cycle"]
+    cycle_rows = _cycle_rows(rows)
     stage_rows = [row for row in rows if row.get("entry_type") == "stage"]
     timeline_rows = cycle_rows or rows
     actions = Counter(row.get("action", "UNKNOWN") for row in cycle_rows)
