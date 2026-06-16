@@ -8,6 +8,7 @@ dependencies = [
     "langchain>=1.1",
     "langchain-ollama>=1.0",
     "langchain-openai>=1.0.1",
+    "langchain-openrouter>=0.2.3",
     "langgraph>=0.2",
     "pydantic>=2",
     "python-dotenv>=1",
