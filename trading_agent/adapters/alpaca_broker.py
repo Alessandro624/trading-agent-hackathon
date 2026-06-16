@@ -27,6 +27,7 @@ class AlpacaBrokerClient:
                     "symbol": position.symbol,
                     "qty": float(position.qty),
                     "market_value": float(position.market_value),
+                    "avg_entry_price": float(getattr(position, "avg_entry_price", 0) or 0),
                 }
                 for position in positions
             ],
