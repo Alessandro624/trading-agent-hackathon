@@ -42,10 +42,11 @@ def execute_decision(
         portfolio_before = broker.get_portfolio()
         cash = float(portfolio_before.get("cash", 0))
         portfolio_value = _safe_float(portfolio_before.get("portfolio_value"))
-        allowed_quantity = risk_policy.max_quantity(
-            cash=cash,
+        allowed_quantity = risk_policy.max_quantity_for_action(
+            action=decision.action,
+            ticker=decision.ticker,
+            portfolio=portfolio_before,
             estimated_price=estimated_price,
-            portfolio_value=portfolio_value,
         )
         risk_explanation = risk_policy.explain(
             cash=cash,

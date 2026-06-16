@@ -43,12 +43,14 @@ FINAL_PROMPT = """You are the ReAct Analyst final decision step.
 Use the tool observations and return only valid JSON matching:
 {"action":"BUY|SELL|HOLD","quantity":0,"confidence":0.0,"rationale":"...","used_data_sources":["..."],"rationale_details":{"summary":"...","evidence":["..."],"risks":["..."],"data_quality":"..."}}
 Do not invent prices, news, technical indicators, failures, guardrails, or portfolio state.
+Human input is advisory but important: consider it explicitly, and if you disagree, explain why using validated data and risk limits.
 If observations reveal missing/degraded data or contradictions, choose HOLD.
 NewsAPI content is a short/truncated preview; treat full article body as available only when read_news_url succeeded.
 If tool failures exist, mention them as data limits, not market signals.
 Quantity rule is strict: BUY/SELL require quantity > 0. HOLD requires quantity 0.
 Use position_sizing.valid_quantity_rule.
-If position_sizing.max_quantity is 0, choose HOLD with quantity 0.
+If the selected action limit is 0, choose HOLD with quantity 0.
+If position_sizing.stop_loss_triggered is true, treat it as a strong risk signal and explain whether to SELL or HOLD.
 Consider position_sizing.current_position and portfolio_context before adding exposure or deciding to SELL.
 Write the rationale for humans reading a dashboard: concise summary, concrete evidence, explicit risks, and data-quality limits.
 """
@@ -61,6 +63,7 @@ def react_analyst_decision(
     retry_policy: RetryPolicy | None = None,
     portfolio: dict | None = None,
     news_provider=None,
+    human_input: list[str] | None = None,
 ) -> TradingDecision:
     retry_policy = retry_policy or RetryPolicy(max_attempts=2)
     metadata = llm_metadata(llm_client)
@@ -79,7 +82,8 @@ def react_analyst_decision(
     final_payload = json.dumps(
         {
             "snapshot": snapshot_payload(snapshot),
-            "recent_journal": compact_recent_entries(recent_entries),
+            "recent_journal": compact_recent_entries(recent_entries, ticker=snapshot.ticker),
+            "human_input": human_input or [],
             "position_sizing": build_position_sizing_context(snapshot, portfolio),
             "tool_observations": observations,
         },

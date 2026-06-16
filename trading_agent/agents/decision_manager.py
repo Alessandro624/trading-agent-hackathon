@@ -22,10 +22,12 @@ logger = get_logger("decision_manager")
 
 SYSTEM_PROMPT = """You are the Decision Manager in a multi-agent trading system.
 Produce one structured TradingDecision from the Scout snapshot, NewsOpinion, TechnicalOpinion, RiskAssessment, and recent journal memory.
-Never exceed risk_assessment.max_quantity. If risk_assessment.can_trade is false, choose HOLD with quantity 0.
+Never exceed risk_assessment.max_buy_quantity for BUY or risk_assessment.max_sell_quantity for SELL. If risk_assessment.can_trade is false, choose HOLD with quantity 0.
 Quantity rule is strict: BUY/SELL require quantity > 0. HOLD requires quantity 0.
+If risk_assessment.stop_loss_triggered is true, treat it as a strong risk signal and explain whether to SELL or HOLD.
 Use any current position information from the risk assessment/portfolio context before adding exposure or deciding to SELL.
 Do not invent prices, news, indicators, portfolio state, or agent opinions.
+Human input is advisory but important: consider it explicitly, and if you disagree, explain why using validated data and risk limits.
 Write a dashboard-ready rationale with the final decision, strongest cross-agent evidence, key risks, and data-quality limits.
 """
 
@@ -38,6 +40,7 @@ def decide_from_opinions(
     risk: RiskAssessment,
     llm_client: LlmClient,
     retry_policy: RetryPolicy | None = None,
+    human_input: list[str] | None = None,
 ) -> TradingDecision:
     metadata = llm_metadata(llm_client)
     if not risk.can_trade:
@@ -68,7 +71,8 @@ def decide_from_opinions(
             "technical_opinion": asdict(technical),
             "news_opinion": asdict(news),
             "risk_assessment": asdict(risk),
-            "recent_journal": compact_recent_entries(recent_entries),
+            "recent_journal": compact_recent_entries(recent_entries, ticker=snapshot.ticker),
+            "human_input": human_input or [],
         },
         default=str,
     )
@@ -104,17 +108,18 @@ def decide_from_opinions(
             rationale_details=safe_rationale_details(snapshot, "Decision Manager validation failed.", errors),
         )
 
-    if parsed.quantity > risk.max_quantity:
+    action_limit = _action_limit(parsed.action, risk)
+    if parsed.action in {"BUY", "SELL"} and parsed.quantity > action_limit:
         return TradingDecision(
             ticker=snapshot.ticker,
             action="HOLD",
             quantity=0,
             confidence=min(parsed.confidence, 0.35),
-            rationale=f"Decision Manager requested quantity {parsed.quantity}, above risk max {risk.max_quantity}; safe HOLD.",
+            rationale=f"Decision Manager requested {parsed.action} quantity {parsed.quantity}, above risk max {action_limit}; safe HOLD.",
             used_data_sources=parsed.used_data_sources or snapshot.data_sources,
-            guardrails_triggered=["guardrail:decision_quantity_above_risk_limit"],
+            guardrails_triggered=["guardrail:decision_quantity_above_action_risk_limit"],
             llm_metadata=metadata,
-            rationale_details=_multi_agent_details(technical, news, risk, "Requested quantity exceeded deterministic risk limit."),
+            rationale_details=_multi_agent_details(technical, news, risk, "Requested quantity exceeded deterministic action-specific risk limit."),
         )
 
     details = _multi_agent_details(technical, news, risk, parsed.rationale_details.get("summary", parsed.rationale))
@@ -148,3 +153,11 @@ def _multi_agent_details(
             "risk": asdict(risk),
         },
     }
+
+
+def _action_limit(action: str, risk: RiskAssessment) -> int:
+    if action == "BUY":
+        return risk.max_buy_quantity
+    if action == "SELL":
+        return risk.max_sell_quantity
+    return 0
