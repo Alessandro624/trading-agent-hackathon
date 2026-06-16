@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+from trading_agent.core.data_hygiene import clean_news_items
+
 Action = Literal["BUY", "SELL", "HOLD"]
 ConfidenceLabel = Literal["high", "medium", "low", "none"]
 Sentiment = Literal["positive", "negative", "neutral", "mixed", "unknown"]
@@ -81,6 +83,7 @@ class MarketSnapshot:
             raise ValueError("invalid price_confidence")
         if self.news_confidence not in {"high", "medium", "low", "none"}:
             raise ValueError("invalid news_confidence")
+        self.news = clean_news_items(self.news)
         if not self.data_sources:
             raise ValueError("data_sources must not be empty")
         if not isinstance(self.technical_indicators, TechnicalIndicators):
@@ -144,6 +147,10 @@ class RiskAssessment:
     reasons: list[str]
     blocked_reason: str | None
     portfolio_context: str = ""
+    max_buy_quantity: int = 0
+    max_sell_quantity: int = 0
+    stop_loss_triggered: bool = False
+    risk_flags: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -151,12 +158,16 @@ class RiskAssessment:
     def validate(self) -> None:
         if self.max_quantity < 0:
             raise ValueError("risk max_quantity must be >= 0")
+        if self.max_buy_quantity < 0 or self.max_sell_quantity < 0:
+            raise ValueError("risk action quantities must be >= 0")
         if not isinstance(self.reasons, list):
             raise ValueError("risk reasons must be a list")
         if not self.can_trade and not self.blocked_reason:
             raise ValueError("blocked risk assessment must include blocked_reason")
         if not isinstance(self.portfolio_context, str):
             raise ValueError("risk portfolio_context must be a string")
+        if not isinstance(self.risk_flags, list):
+            raise ValueError("risk_flags must be a list")
 
 
 @dataclass(slots=True)
@@ -258,12 +269,16 @@ class JournalEntry:
     llm_fallback_reason: str | None = None
     guardrails_triggered: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    human_input_used: list[str] = field(default_factory=list)
+    entry_type: Literal["cycle"] = "cycle"
 
     def __post_init__(self) -> None:
         self.validate()
 
     def validate(self) -> None:
         self.ticker = self.ticker.upper()
+        if self.entry_type != "cycle":
+            raise ValueError("journal entry_type must be cycle")
         if self.action not in {"BUY", "SELL", "HOLD"}:
             raise ValueError("journal action must be BUY, SELL, or HOLD")
         if not 0 <= self.confidence <= 1:
@@ -286,6 +301,8 @@ class JournalEntry:
             raise ValueError("guardrails_triggered must be a list")
         if not isinstance(self.failures, list):
             raise ValueError("failures must be a list")
+        if not isinstance(self.human_input_used, list):
+            raise ValueError("human_input_used must be a list")
         if not isinstance(self.llm_fallback_used, bool):
             raise ValueError("llm_fallback_used must be a bool")
 

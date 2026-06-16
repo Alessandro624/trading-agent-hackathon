@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from urllib.parse import urlencode
 
-from trading_agent.core import validate_news_query
+from trading_agent.core import clean_news_article, validate_news_query
 from trading_agent.utils import request_json, require_env
 
 
@@ -36,17 +36,15 @@ class NewsApiProvider:
         payload = request_json(f"https://newsapi.org/v2/{endpoint}?{query}")
         articles = payload.get("articles", [])
         return [
-            {
-                "title": article.get("title"),
-                "description": article.get("description"),
-                "content": article.get("content"),
-                "source": (article.get("source") or {}).get("name"),
-                "url": article.get("url"),
-                "published_at": article.get("publishedAt"),
-                "endpoint": endpoint,
-                "query_strategy": strategy,
-                "sort_by": sort_by if strategy == "everything" else None,
-                "search_in": search_in,
-            }
+            clean_news_article(
+                {
+                    **article,
+                    "endpoint": endpoint,
+                    "query_strategy": strategy,
+                    "sort_by": sort_by if strategy == "everything" else None,
+                    "search_in": search_in,
+                }
+            )
             for article in articles
+            if isinstance(article, dict)
         ]
