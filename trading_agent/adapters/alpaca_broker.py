@@ -31,3 +31,30 @@ class AlpacaBrokerClient:
                 for position in positions
             ],
         }
+
+    def place_order(self, ticker: str, action: str, quantity: int) -> dict:
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        from alpaca.trading.requests import MarketOrderRequest
+
+        order = self.client.submit_order(
+            MarketOrderRequest(
+                symbol=ticker.upper(),
+                qty=quantity,
+                side=OrderSide.BUY if action == "BUY" else OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+            )
+        )
+        return {"id": str(order.id), "status": _status_value(order.status)}
+
+    def get_order(self, order_id: str) -> dict:
+        order = self.client.get_order_by_id(order_id)
+        filled_avg_price = getattr(order, "filled_avg_price", None)
+        return {
+            "id": str(order.id),
+            "status": _status_value(order.status),
+            "filled_avg_price": float(filled_avg_price) if filled_avg_price is not None else None,
+        }
+
+
+def _status_value(status) -> str:
+    return str(getattr(status, "value", status)).lower()
