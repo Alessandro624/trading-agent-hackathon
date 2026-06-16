@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass, field
 from typing import Optional, Any
 from alpaca.trading.client import TradingClient
@@ -7,37 +9,36 @@ from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass, AssetExchange, AssetStatus
 
 from trading_agent.utils.config import require_env
-
-
-@dataclass
-class WorldConfig:
-    asset_class: AssetClass = field(default=AssetClass.US_EQUITY)
-    exchages: list[AssetExchange] = field(default_factory=list)
+from trading_agent.core.data_hygiene import clean_text
 
 
 class TickerProvider:
 
     def __init__(self):
-        self.default_world: WorldConfig = WorldConfig()
-        self.current_world: Optional[WorldConfig] = None
-
         self.trading_client: TradingClient = TradingClient(
             api_key=require_env("ALPACA_API_KEY"),
             secret_key=require_env("ALPACA_SECRET_KEY")
         )
 
-
-    def _define_world(self, watchlist_params: Optional[str] = None) -> None:
-        return None
+    def _parse_watchlist(self, value: str | None) -> list[str]:
+        if not value:
+            return []
+        
+        raw_items = value.split(",") if isinstance(value, str) else list(value)
+        symbols: list[str] = []
+        for item in raw_items:
+            symbol = clean_text(item, max_chars=16).upper()
+            if not symbol or not re.fullmatch(r"[A-Z]{1,5}", symbol):
+                continue
+            if symbol not in symbols:
+                symbols.append(symbol)
+        return symbols
 
 
     def _get_tickers(self, watchlist_params: Optional[str] = None) -> set[str]:
 
-        if watchlist_params:
-            self._define_world(watchlist_params)
-
         request_params: GetAssetsRequest = GetAssetsRequest(
-            asset_class = self.current_world.asset_class if self.current_world else self.default_world.asset_class,
+            asset_class = AssetClass.US_EQUITY,
             status=AssetStatus.ACTIVE
         )
 
@@ -47,10 +48,15 @@ class TickerProvider:
             return set()
         
         asset_symbols: set[str] = set()
-        
+
         for a in available_assets:
-            if a.symbol:
+            if a.symbol and a.tradable:
                 asset_symbols.add(a.symbol)
+
+
+        watchlist_symbols: list[str] = self._parse_watchlist(watchlist_params)
+        if watchlist_symbols:
+            return set.intersection(asset_symbols, watchlist_symbols)        
 
         return asset_symbols
     
@@ -76,7 +82,7 @@ if __name__ == '__main__':
 
     t = TickerProvider()
 
-    tickers = t.get_tickers_with_info()
+    tickers = t.get_tickers_with_info("AAPL,NVDA")
 
     print(tickers[:5])
 
