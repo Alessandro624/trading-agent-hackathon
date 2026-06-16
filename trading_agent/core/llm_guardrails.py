@@ -6,11 +6,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from trading_agent.core.actions import Action, QUANTITY_RULE_TEXT, quantity_is_valid_for_action
 from trading_agent.core.models import MarketSnapshot
 
 
 class AnalystDecisionOutput(BaseModel):
-    action: Literal["BUY", "SELL", "HOLD"]
+    action: Action
     quantity: int = Field(ge=0)
     confidence: float = Field(ge=0.0, le=1.0)
     rationale: str = Field(min_length=10)
@@ -21,10 +22,8 @@ class AnalystDecisionOutput(BaseModel):
     @classmethod
     def action_quantity_is_consistent(cls, value: int, info):
         action = info.data.get("action")
-        if action == "HOLD" and value != 0:
-            raise ValueError("HOLD must use quantity 0")
-        if action in {"BUY", "SELL"} and value <= 0:
-            raise ValueError("BUY/SELL must use quantity greater than 0")
+        if action and not quantity_is_valid_for_action(action, value):
+            raise ValueError(QUANTITY_RULE_TEXT)
         return value
 
 
