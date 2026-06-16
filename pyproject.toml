@@ -16,6 +16,7 @@ dependencies = [
 
 [project.scripts]
 trading-agent = "trading_agent.scripts.run_agent:main"
+human-input = "trading_agent.scripts.human_input:main"
 test-connection = "trading_agent.scripts.test_connection:main"
 
 [build-system]
