@@ -66,5 +66,6 @@ def assess_risk(
         assessment.max_buy_quantity,
         assessment.max_sell_quantity,
         assessment.stop_loss_triggered,
+        assessment.take_profit_triggered,
     )
     return assessment
