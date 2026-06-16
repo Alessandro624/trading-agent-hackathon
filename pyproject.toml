@@ -2,7 +2,17 @@
 name = "trading-agent"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["alpaca-py>=0.30", "python-dotenv>=1"]
+dependencies = [
+    "alpaca-py>=0.30",
+    "beautifulsoup4>=4.12",
+    "langchain>=1.1",
+    "langchain-ollama>=1.0",
+    "langchain-openai>=1.0.1",
+    "langgraph>=0.2",
+    "pydantic>=2",
+    "python-dotenv>=1",
+    "requests>=2.32",
+]
 
 [project.scripts]
 test-connection = "trading_agent.scripts.test_connection:main"
