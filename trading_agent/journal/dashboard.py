@@ -734,13 +734,6 @@ def _format_dashboard_value(value: Any) -> Any:
     return value
 
 
-def _llm_inline(row: dict[str, Any]) -> str:
-    provider = row.get("llm_provider") or "none"
-    if row.get("llm_fallback_used"):
-        return f'<span class="llm-chip fallback">Fallback</span><br>{_e(provider)}'
-    return f'<span class="llm-chip">{_e(provider)}</span>'
-
-
 def _data_quality_pill(row: dict[str, Any]) -> str:
     snapshot = row.get("market_snapshot") or {}
     values = [
@@ -900,31 +893,6 @@ def _portfolio_path_detail(cash_delta: float | None, value_delta: float | None) 
     return f"Cash movement {_format_signed_money(cash_delta)}"
 
 
-def _portfolio_html(row: dict[str, Any]) -> str:
-    before = _portfolio_before(row)
-    portfolio = _portfolio_after(row)
-    if not portfolio and not before:
-        return '<span class="muted">No snapshot</span>'
-    cash = _safe_float((portfolio or {}).get("cash"))
-    cash_before = _safe_float((before or {}).get("cash"))
-    delta = None if cash is None or cash_before is None else cash - cash_before
-    positions = _positions_count((portfolio or {}).get("positions"))
-    cash_ratio = 0 if cash is None else max(0, min(100, cash / 10000 * 100))
-    cash_text = _format_money(cash) if cash is not None else "unknown"
-    delta_class = " negative" if delta is not None and delta < 0 else ""
-    delta_text = _format_signed_money(delta) if delta is not None else "n/a"
-    return (
-        '<div class="portfolio-mini">'
-        f'<div class="portfolio-line"><b>Cash</b><span>{_e(cash_text)}</span></div>'
-        '<div class="portfolio-track">'
-        f'<div class="portfolio-bar" style="width:{cash_ratio:.0f}%"></div>'
-        '</div>'
-        f'<span class="portfolio-delta{delta_class}">{_e(delta_text)}</span>'
-        f'<div class="portfolio-pos">Positions: {positions}</div>'
-        '</div>'
-    )
-
-
 def _portfolio_delta_html(row: dict[str, Any]) -> str:
     before = _portfolio_before(row)
     after = _portfolio_after(row)
@@ -1061,14 +1029,6 @@ def _format_signed_money(value: float | None) -> str:
     return f"{sign}${abs(value):,.2f}"
 
 
-def _data_confidence(row: dict[str, Any]) -> str:
-    snapshot = row.get("market_snapshot") or {}
-    price = snapshot.get("price_confidence", "-")
-    news = snapshot.get("news_confidence", "-")
-    technical = (snapshot.get("technical_indicators") or {}).get("confidence", "-")
-    return f"price:{price} news:{news} technical:{technical}"
-
-
 def _data_readiness(row: dict[str, Any]) -> str:
     snapshot = row.get("market_snapshot") or {}
     price = snapshot.get("price_confidence", "none")
@@ -1086,35 +1046,6 @@ def _data_readiness(row: dict[str, Any]) -> str:
     return "Partial data: " + ", ".join(missing)
 
 
-def _data_source_html(value: Any) -> str:
-    raw = str(value or "-")
-    if raw == "-":
-        return '<span class="muted">-</span>'
-    labels = [_source_label(item.strip()) for item in raw.split(",") if item.strip()]
-    return '<div class="source-list">' + "".join(
-        f'<span class="source-pill">{_e(label)}</span>' for label in labels
-    ) + "</div>"
-
-
-def _source_label(value: str) -> str:
-    mapping = {
-        "alpaca_or_mock_market_data": "market",
-        "news_provider": "news",
-        "technical_indicators": "technical",
-        "alpaca_api": "alpaca",
-        "news_api": "news",
-    }
-    return mapping.get(value, value.replace("_", " "))
-
-
-def _confidence_html(row: dict[str, Any]) -> str:
-    decision = float(row.get("confidence", 0))
-    return (
-        f'<span class="confidence-chip">decision {decision:.2f}</span><br>'
-        f'<span class="muted">{_e(_data_confidence(row))}</span>'
-    )
-
-
 def _outcome_text(row: dict[str, Any]) -> str:
     execution = row.get("execution_result") or {}
     if execution:
@@ -1128,12 +1059,6 @@ def _retry_count(row: dict[str, Any]) -> int:
     snapshot = row.get("market_snapshot") or {}
     execution = row.get("execution_result") or {}
     return int(snapshot.get("retry_count") or 0) + int(execution.get("retry_count") or 0)
-
-
-def _inline_list(items: list[Any], css_class: str) -> str:
-    if not items:
-        return '<span class="muted">-</span>'
-    return "<br>".join(f'<span class="{css_class}">{_e(str(item))}</span>' for item in items)
 
 
 def _markdown_list(items: list[Any], empty: str) -> str:
