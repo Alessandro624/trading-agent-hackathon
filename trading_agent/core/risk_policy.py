@@ -19,6 +19,7 @@ class RiskPolicy:
     cash_risk_fraction: float = 0.10
     portfolio_risk_fraction: float = 0.02
     stop_loss_fraction: float = 0.08
+    take_profit_fraction: float = 0.12
 
     @classmethod
     def from_env(cls) -> "RiskPolicy":
@@ -28,6 +29,7 @@ class RiskPolicy:
             cash_risk_fraction=float(os.getenv("TRADING_CASH_RISK_FRACTION", "0.10")),
             portfolio_risk_fraction=float(os.getenv("TRADING_PORTFOLIO_RISK_FRACTION", "0.02")),
             stop_loss_fraction=float(os.getenv("TRADING_STOP_LOSS_FRACTION", "0.08")),
+            take_profit_fraction=float(os.getenv("TRADING_TAKE_PROFIT_FRACTION", "0.12")),
         )
 
     def max_quantity(
@@ -102,6 +104,8 @@ class RiskPolicy:
             f"max_notional_per_order={self.max_notional_per_order:.2f}, "
             f"cash_risk_fraction={self.cash_risk_fraction:.2f}, "
             f"portfolio_risk_fraction={self.portfolio_risk_fraction:.2f}, "
+            f"stop_loss_fraction={self.stop_loss_fraction:.2f}, "
+            f"take_profit_fraction={self.take_profit_fraction:.2f}, "
             f"cash={cash_text}, estimated_price={price_text}"
             f", portfolio_value={portfolio_text}"
         )
@@ -128,7 +132,12 @@ def build_position_sizing_context(
     )
     max_sell_quantity = risk_policy.max_sell_quantity(current_quantity=current_qty)
     stop_loss_triggered = _stop_loss_triggered(snapshot.price, current_position, risk_policy.stop_loss_fraction)
-    risk_flags = ["stop_loss_triggered"] if stop_loss_triggered else []
+    take_profit_triggered = _take_profit_triggered(snapshot.price, current_position, risk_policy.take_profit_fraction)
+    risk_flags: list[str] = []
+    if stop_loss_triggered:
+        risk_flags.append("stop_loss_triggered")
+    if take_profit_triggered:
+        risk_flags.append("take_profit_triggered")
     return {
         "cash": cash,
         "portfolio_value": portfolio_value,
@@ -138,6 +147,7 @@ def build_position_sizing_context(
         "max_quantity": max(max_buy_quantity, max_sell_quantity),
         "max_buy_quantity": max_buy_quantity,
         "max_sell_quantity": max_sell_quantity,
+        "take_profit_triggered": take_profit_triggered,
         "stop_loss_triggered": stop_loss_triggered,
         "risk_flags": risk_flags,
         "valid_quantity_rule": (
@@ -155,6 +165,7 @@ def build_position_sizing_context(
         )
         + _position_risk_explanation(snapshot.price, current_position, portfolio_value, risk_policy),
     }
+
 
 def _portfolio_context(ticker: str, positions: dict[str, dict[str, float]]) -> str:
     current = positions.get(ticker.upper())
@@ -195,6 +206,20 @@ def _position_risk_explanation(
     ]
     if avg_entry_price > 0:
         parts.append(f", avg_entry_price={avg_entry_price:.2f}")
+    if _take_profit_triggered(current_price, current_position, risk_policy.take_profit_fraction):
+        parts.append(f", take_profit_triggered=True threshold={risk_policy.take_profit_fraction:.2f}")
     if _stop_loss_triggered(current_price, current_position, risk_policy.stop_loss_fraction):
         parts.append(f", stop_loss_triggered=True threshold={risk_policy.stop_loss_fraction:.2f}")
     return "".join(parts)
+
+
+def _take_profit_triggered(
+    current_price: float | None,
+    current_position: dict[str, float],
+    take_profit_fraction: float,
+) -> bool:
+    avg_entry_price = current_position.get("avg_entry_price", 0.0)
+    qty = current_position.get("qty", 0.0)
+    if current_price is None or current_price <= 0 or avg_entry_price <= 0 or qty <= 0:
+        return False
+    return current_price >= avg_entry_price * (1 + take_profit_fraction)

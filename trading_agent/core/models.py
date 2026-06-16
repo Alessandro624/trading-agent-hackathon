@@ -150,6 +150,7 @@ class RiskAssessment:
     max_buy_quantity: int = 0
     max_sell_quantity: int = 0
     stop_loss_triggered: bool = False
+    take_profit_triggered: bool = False
     risk_flags: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -166,6 +167,8 @@ class RiskAssessment:
             raise ValueError("blocked risk assessment must include blocked_reason")
         if not isinstance(self.portfolio_context, str):
             raise ValueError("risk portfolio_context must be a string")
+        if not isinstance(self.take_profit_triggered, bool):
+            raise ValueError("risk take_profit_triggered must be a bool")
         if not isinstance(self.risk_flags, list):
             raise ValueError("risk_flags must be a list")
 

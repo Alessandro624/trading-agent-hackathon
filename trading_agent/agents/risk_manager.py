@@ -28,6 +28,7 @@ def assess_risk(
             max_buy_quantity=int(sizing["max_buy_quantity"]),
             max_sell_quantity=int(sizing["max_sell_quantity"]),
             stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
+            take_profit_triggered=bool(sizing["take_profit_triggered"]),
             risk_flags=list(sizing["risk_flags"]),
         )
 
@@ -43,6 +44,7 @@ def assess_risk(
             max_buy_quantity=0,
             max_sell_quantity=0,
             stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
+            take_profit_triggered=bool(sizing["take_profit_triggered"]),
             risk_flags=list(sizing["risk_flags"]),
         )
 
@@ -55,6 +57,7 @@ def assess_risk(
         max_buy_quantity=int(sizing["max_buy_quantity"]),
         max_sell_quantity=int(sizing["max_sell_quantity"]),
         stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
+        take_profit_triggered=bool(sizing["take_profit_triggered"]),
         risk_flags=list(sizing["risk_flags"]),
     )
     logger.info(

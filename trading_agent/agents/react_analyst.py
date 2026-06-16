@@ -51,7 +51,7 @@ If tool failures exist, mention them as data limits, not market signals.
 Quantity rule is strict: BUY/SELL require quantity > 0. HOLD/WAIT require quantity 0.
 Use position_sizing.valid_quantity_rule.
 If the selected action limit is 0, choose HOLD or WAIT with quantity 0.
-If position_sizing.stop_loss_triggered is true, treat it as a strong risk signal and explain whether to SELL or HOLD.
+If position_sizing.stop_loss_triggered or position_sizing.take_profit_triggered is true, treat it as a strong risk signal and explain whether to SELL or HOLD.
 Consider position_sizing.current_position and portfolio_context before adding exposure or deciding to SELL.
 Write the rationale for humans reading a dashboard: concise summary, concrete evidence, explicit risks, and data-quality limits.
 """
@@ -231,12 +231,6 @@ def _with_tool_audit(details: dict[str, Any], observations: list[dict[str, Any]]
     enriched = dict(details or {})
     enriched["tool_audit"] = {
         "tools_used": [item.get("tool") for item in observations if item.get("tool")],
-        "tool_failures": [
-            item
-            for item in observations
-            if item.get("error") or ((item.get("observation") or {}).get("status") == "failed")
-        ],
+        "tool_failures": [item for item in observations if item.get("error") or ((item.get("observation") or {}).get("status") == "failed")],
     }
     return enriched
-
-
