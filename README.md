@@ -1,4 +1,4 @@
-# Meet Hack-a-ton! Our Autonomous Trading Agentic System
+# Meet Hack-a-Ton! Our Autonomous Trading Agentic System
 
 > An autonomous, LLM-powered trading agent, built around the **LangChain** and **Alpaca Markets** Framework, that observes the market, reasons about opportunities, and acts — without requiring human intervention between cycles.
 
