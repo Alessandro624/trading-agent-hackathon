@@ -851,6 +851,7 @@ INTENT TYPES:
 | advisory          | Opinion, context, no trade action    | always empty                                  |
 
 INTENT RULES:
+- PRIORITY RULE: If the human note explicitly requests to buy or sell a specific brand, company, or ticker (e.g., "sell meta stocks", "vendi apple"), you MUST classify it as `forced_sell` or `forced_buy` targeting ONLY that specific ticker. NEVER generalize an explicit single-company request into a `broad_sell` or `position_sweep`.
 - topic mandatory for: broad_sell, conditional_sell, position_sweep.
 - position_sweep: if note is ambiguous, downgrade to broad_sell + topic.
 - forced_buy: do not invent unnamed tickers.
