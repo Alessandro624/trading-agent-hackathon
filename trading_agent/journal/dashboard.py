@@ -512,10 +512,11 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     <div class="table-wrap">
       <table>
         <colgroup>
-          <col style="width:12%">
+          <col style="width:11%">
+          <col style="width:11%">
+          <col style="width:42%">
           <col style="width:13%">
-          <col style="width:51%">
-          <col style="width:14%">
+          <col style="width:13%">
           <col style="width:10%">
         </colgroup>
         <thead>
@@ -524,6 +525,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
             <th>Action</th>
             <th>Summary</th>
             <th>Cash movement</th>
+            <th>Diversification</th>
             <th>Outcome</th>
           </tr>
         </thead>
@@ -582,6 +584,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
         block("Failures", item.failures_markdown) +
         block("LLM provider", item.llm_markdown) +
         block("Portfolio after", item.portfolio_markdown) +
+        block("Sector diversification", item.diversification_text) +
         block("Outcome", item.outcome) +
         block("Structured details", item.structured_details);
       document.getElementById("detailDialog").showModal();
@@ -892,6 +895,9 @@ def _render_row(index: int, row: dict[str, Any]) -> str:
     ticker = row.get("ticker", "-")
     signals = _signals_html(row)
     portfolio = _portfolio_delta_html(row)
+    after_positions = (_portfolio_after(row) or {}).get("positions")
+    breakdown = _sector_breakdown(after_positions)
+    diversification_html = _sector_bar_html(breakdown)
     outcome = _outcome_text(row)
     outcome_badge = _outcome_badge_html(row)
     timestamp = str(row.get("timestamp", "-"))
@@ -903,6 +909,7 @@ def _render_row(index: int, row: dict[str, Any]) -> str:
           <td data-label="Action"><span class="badge {_e(action)}">{_e(action)} {_e(ticker)}</span></td>
           <td data-label="Summary"><div class="cell-clamp summary-cell">{_e(row.get("cycle_summary", "-"))}</div><div class="summary-signals">{signals}</div></td>
           <td data-label="Cash movement">{portfolio}</td>
+          <td data-label="Diversification">{diversification_html}</td>
           <td data-label="Outcome">{outcome_badge}</td>
         </tr>"""
 
@@ -931,6 +938,7 @@ def _details_payload(row: dict[str, Any]) -> dict[str, str]:
         "failures_markdown": _markdown_list(row.get("failures") or [], "No failures recorded."),
         "llm_markdown": _llm_markdown(row),
         "portfolio_markdown": _portfolio_markdown(row),
+        "diversification_text": _diversification_text(_portfolio_after(row)),
         "outcome": _outcome_text(row),
         "structured_details": json.dumps(_format_dashboard_value(row), indent=2, ensure_ascii=False),
     }
@@ -1383,7 +1391,7 @@ def _markdown_list(items: list[Any], empty: str) -> str:
 
 
 def _empty_row() -> str:
-    return '<tr><td colspan="5" class="muted">No entries yet.</td></tr>'
+    return '<tr><td colspan="6" class="muted">No entries yet.</td></tr>'
 
 
 def _timestamp_html(value: str) -> str:
@@ -1409,6 +1417,54 @@ def _parse_datetime(value: str) -> datetime | None:
     if parsed.tzinfo is not None:
         return parsed.astimezone().replace(tzinfo=None)
     return parsed
+
+
+def _sector_breakdown(positions: Any) -> dict[str, float]:
+    try:
+        from trading_agent.core.rebalance import TICKER_SECTOR
+    except ImportError:
+        return {}
+    normalized = normalize_positions(positions)
+    totals: dict[str, float] = {}
+    for symbol, data in normalized.items():
+        sector = TICKER_SECTOR.get(symbol.upper(), "other")
+        mv = _safe_float(data.get("market_value")) or 0.0
+        totals[sector] = totals.get(sector, 0) + mv
+    total = sum(totals.values())
+    if total <= 0:
+        return {}
+    return {s: round(v / total * 100, 1) for s, v in sorted(totals.items())}
+
+
+def _sector_bar_html(breakdown: dict[str, float]) -> str:
+    if not breakdown:
+        return '<span class="muted">—</span>'
+    COLORS = {
+        "technology": "#1769aa",
+        "automotive": "#147d4f",
+        "manufacturing": "#b54708",
+        "energy": "#b42318",
+        "healthcare": "#5b21b6",
+        "finance": "#0e7490",
+        "consumer": "#92400e",
+        "other": "#667085",
+    }
+    bars = "".join(f'<div style="height:100%;width:{pct}%;background:{COLORS.get(sector,"#667085")};' f"title='{sector} {pct}%'\"></div>" for sector, pct in breakdown.items())
+    labels = " ".join(f'<span style="font-size:11px;color:{COLORS.get(s,"#667085")}">' f"{s[:4]} {p}%</span>" for s, p in breakdown.items())
+    return (
+        f'<div style="display:flex;height:6px;border-radius:999px;overflow:hidden;'
+        f'background:#eef1f5;margin-bottom:3px">{bars}</div>'
+        f'<div style="display:flex;flex-wrap:wrap;gap:4px">{labels}</div>'
+    )
+
+
+def _diversification_text(portfolio: dict | None) -> str:
+    if not portfolio:
+        return "No portfolio snapshot."
+    breakdown = _sector_breakdown(portfolio.get("positions"))
+    if not breakdown:
+        return "No open positions."
+    return "\n".join(f"- {sector}: {pct}%" for sector, pct in breakdown.items())
 
 
 def _e(value: Any) -> str:

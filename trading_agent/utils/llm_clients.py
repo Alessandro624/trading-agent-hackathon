@@ -165,12 +165,6 @@ class FallbackLlmClient:
             self._metadata = _metadata(_provider_name(self.primary))
             return value
         except Exception as error:
-            logger.warning(
-                "llm.fallback primary=%s fallback=%s reason=%s",
-                _provider_name(self.primary),
-                _provider_name(self.fallback),
-                error,
-            )
             value = call(self.fallback)
             self._metadata = _metadata(
                 _provider_name(self.fallback),

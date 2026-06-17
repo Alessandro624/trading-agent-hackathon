@@ -377,6 +377,57 @@ def _llm_resolve_note(
             excluded_tickers,
         )
 
+    if intent_type == "rebalance_request":
+        if confidence < 0.7:
+            logger.info(
+                "human.resolver.llm.rebalance.reject reason=confidence_below_threshold confidence=%.2f",
+                confidence,
+            )
+            return []
+        try:
+            from trading_agent.core.rebalance import build_rebalance_plan
+
+            plan = build_rebalance_plan(portfolio, llm_client)
+        except Exception as error:
+            logger.warning("human.resolver.llm.rebalance.fail reason=%s", error)
+            return []
+        if not plan.suggested_buys:
+            logger.info(
+                "human.resolver.llm.rebalance.skip reason=portfolio_already_diversified note=%s",
+                _short_note(note),
+            )
+            return [
+                HumanInstruction(
+                    note,
+                    None,
+                    "human_context",
+                    resolver_intent_type="advisory",
+                    resolver_confidence=confidence,
+                    resolver_rationale="Portfolio is already diversified across sectors. No rebalance needed.",
+                    resolver_topic=topic,
+                )
+            ]
+        total = len(plan.suggested_buys)
+        logger.info(
+            "human.resolver.llm.rebalance.accept suggested=%s rationale=%s",
+            ",".join(plan.suggested_buys),
+            plan.rationale,
+        )
+        return [
+            HumanInstruction(
+                note,
+                ticker,
+                "human_rebalance",
+                index,
+                total,
+                confidence,
+                plan.rationale,
+                topic or "portfolio_rebalance",
+                "forced_buy",
+            )
+            for index, ticker in enumerate(plan.suggested_buys, start=1)
+        ]
+
     logger.info(
         "human.resolver.llm.advisory intent_type=%s confidence=%.2f topic=%s note=%s",
         intent_type,
@@ -828,6 +879,11 @@ INTENT TYPES (pick exactly one)
                      NEVER invent instruction IDs — they must come from the provided context.
 - advisory         : Note is context, opinion, or a watch suggestion with no direct trade
                      instruction. target_tickers MUST be empty. Set confidence < 0.6.
+- rebalance_request: The user wants to diversify or rebalance the portfolio across sectors.
+                     (e.g. " I want to balance portfolio", "diversify my holdings",
+                     "voglio diversificare", "bilancia il portfolio").
+                     target_tickers MUST be empty - the agent will compute rebalance targets itself.
+                     Set topic to the diversification goal. confidence >= 0.7.
 
 CANCEL TARGET RESOLUTION (CRITICAL)
 When the user writes things like "cancel that", "annulla quello di prima", "non farlo più",
@@ -899,6 +955,7 @@ DECISION RULES
    - buy-side intents (forced_buy) -> watchlist, except an explicitly named outside ticker may be returned for provider validation
    - news_request -> either sellable_open_position_tickers OR watchlist (whichever contains the named company)
    - advisory -> always empty
+   - rebalance_request -> always empty target_tickers
 2. Never invent a ticker that is not in the appropriate universe or explicitly named by the user.
    If the user names a sell ticker you do not see in sellable_open_position_tickers, mention it
    in `excluded_tickers` with rationale "not held" and pick intent_type accordingly.
