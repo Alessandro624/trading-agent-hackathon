@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from trading_agent.core import BrokerClient, LlmClient, MarketDataProvider, NewsProvider, TradingDecision, is_trade_action, parse_human_intent, utc_now_iso
+from trading_agent.core import BrokerClient, LlmClient, MarketDataProvider, NewsProvider, RiskPolicy, TradingDecision, is_trade_action, parse_human_intent, utc_now_iso
+from trading_agent.core.execution_policy import classify_failure
 from trading_agent.journal import JournalStore
 from trading_agent.agents import (
     assess_risk,
@@ -26,6 +27,7 @@ class State(TypedDict, total=False):
     technical_opinion: Any
     news_opinion: Any
     risk_assessment: Any
+    risk_policy: Any
     draft_decision: Any
     final_decision: Any
     execution_result: Any
@@ -33,6 +35,10 @@ class State(TypedDict, total=False):
     cycle_started_at: str
     human_input: list[str]
     human_intent: dict[str, Any]
+    human_risk_profile: dict[str, Any]
+    instruction_id: str | None
+    retry_count: int
+    reversal_of: str | None
 
 
 def build_graph(
@@ -113,7 +119,7 @@ def build_multi_agent_graph(
         )
 
     def risk_node(state: State) -> State:
-        return _run_stage(state, journal, "risk_manager", lambda: _risk_analysis(state, broker))
+        return _run_stage(state, journal, "risk_manager", lambda: _risk_analysis(state, broker, llm_client))
 
     def decision_node(state: State) -> State:
         return _run_stage(
@@ -183,8 +189,7 @@ def _add_common_tail_nodes(
             state,
             journal,
             "reflection",
-            lambda: state.update({"final_decision": reflect_decision(state["snapshot"], state["draft_decision"], llm_client)})
-            or state,
+            lambda: state.update({"final_decision": reflect_decision(state["snapshot"], state["draft_decision"], llm_client)}) or state,
         )
 
     def executor_node(state: State) -> State:
@@ -196,6 +201,8 @@ def _add_common_tail_nodes(
         )
 
     def journal_node(state: State) -> State:
+        execution_result = state.get("execution_result")
+        failure_type = _classify_execution_failure(execution_result)
         return _run_stage(
             state,
             journal,
@@ -209,6 +216,11 @@ def _add_common_tail_nodes(
                         draft_decision=state.get("draft_decision"),
                         cycle_started_at=state.get("cycle_started_at"),
                         human_input=state.get("human_input", []),
+                        instruction_id=state.get("instruction_id"),
+                        retry_count=state.get("retry_count", 0),
+                        failure_type=failure_type,
+                        reversal_of=state.get("reversal_of"),
+                        risk_assessment=state.get("risk_assessment"),
                     )
                 }
             )
@@ -220,6 +232,24 @@ def _add_common_tail_nodes(
     graph.add_node("journal", journal_node)
 
 
+def _classify_execution_failure(execution_result: Any) -> str | None:
+    if execution_result is None:
+        return None
+    status = str(getattr(execution_result, "status", "") or "").lower()
+    if status not in {"failed", "rejected", "blocked"}:
+        return None
+    message = str(getattr(execution_result, "message", "") or "")
+    risk_explanation = str(getattr(execution_result, "risk_explanation", "") or "")
+    combined = f"{message} {risk_explanation}"
+    failure = classify_failure(
+        instruction_id=None,
+        outcome=status,
+        error_message=combined,
+        execution_status=status,
+    )
+    return failure.failure_type
+
+
 def run_cycle(
     agent,
     ticker: str,
@@ -227,12 +257,18 @@ def run_cycle(
     journal: JournalStore | None = None,
     cycle_started_at: str | None = None,
     human_input: list[str] | None = None,
+    human_intent: dict[str, Any] | None = None,
+    human_risk_profile: dict[str, Any] | None = None,
+    instruction_id: str | None = None,
+    retry_count: int = 0,
+    reversal_of: str | None = None,
 ) -> State:
     symbol = ticker.upper()
     started_at = cycle_started_at or utc_now_iso()
     human_notes = human_input or []
-    human_intent = parse_human_intent(human_notes).to_dict()
-    logger.info("cycle.start ticker=%s started_at=%s", symbol, started_at)
+    if human_intent is None:
+        human_intent = parse_human_intent(human_notes).to_dict()
+    logger.info("cycle.start ticker=%s started_at=%s instruction_id=%s retry=%s", symbol, started_at, instruction_id, retry_count)
     if journal is not None:
         journal.append_stage(
             ticker=symbol,
@@ -240,7 +276,14 @@ def run_cycle(
             status="started",
             message="Cycle started.",
             cycle_started_at=started_at,
-            details={"human_input": human_notes, "human_intent": human_intent},
+            details={
+                "human_input": human_notes,
+                "human_intent": human_intent,
+                "human_risk_profile": human_risk_profile or {},
+                "instruction_id": instruction_id,
+                "retry_count": retry_count,
+                "reversal_of": reversal_of,
+            },
         )
     try:
         state = agent.invoke(
@@ -250,6 +293,10 @@ def run_cycle(
                 "cycle_started_at": started_at,
                 "human_input": human_notes,
                 "human_intent": human_intent,
+                "human_risk_profile": human_risk_profile or {},
+                "instruction_id": instruction_id,
+                "retry_count": retry_count,
+                "reversal_of": reversal_of,
             }
         )
     except Exception as error:
@@ -312,9 +359,17 @@ def _single_agent_analysis(
     return state
 
 
-def _risk_analysis(state: State, broker: BrokerClient) -> State:
+def _risk_analysis(state: State, broker: BrokerClient, llm_client: LlmClient) -> State:
     portfolio = _portfolio_for_sizing(broker, state["ticker"])
-    state["risk_assessment"] = assess_risk(state["snapshot"], portfolio)
+    assessment = assess_risk(
+        state["snapshot"],
+        portfolio,
+        human_input=state.get("human_input", []),
+        llm_client=llm_client,
+        human_risk_profile=state.get("human_risk_profile"),
+    )
+    state["risk_assessment"] = assessment
+    state["risk_policy"] = RiskPolicy.from_env().adjusted_for_human_profile(assessment.human_risk_profile)
     return state
 
 
@@ -327,6 +382,7 @@ def _execute_with_price(state: State, market_data: MarketDataProvider, broker: B
         state["final_decision"],
         broker,
         estimated_price=order_price,
+        risk_policy=state.get("risk_policy"),
     )
     return state
 
@@ -359,10 +415,7 @@ def _defer_trade_if_market_closed(state: State, broker: BrokerClient) -> bool:
         action="WAIT",
         quantity=0,
         confidence=min(decision.confidence, 0.6),
-        rationale=(
-            f"Market is closed according to broker clock; WAIT until next_open={next_open}. "
-            f"Original decision was {original}: {decision.rationale}"
-        ),
+        rationale=(f"Market is closed according to broker clock; WAIT until next_open={next_open}. " f"Original decision was {original}: {decision.rationale}"),
         used_data_sources=[*decision.used_data_sources, "broker_clock"],
         guardrails_triggered=[*decision.guardrails_triggered, "guardrail:market_closed_wait"],
         reflection=_merge_market_clock_reflection(decision.reflection, clock),

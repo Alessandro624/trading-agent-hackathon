@@ -1,28 +1,8 @@
 from __future__ import annotations
 
-import re
 from dataclasses import asdict, dataclass
 
 from trading_agent.core.data_hygiene import clean_text
-
-_SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}\b")
-_ALIASES = {
-    "APPLE": "AAPL",
-    "MICROSOFT": "MSFT",
-    "NVIDIA": "NVDA",
-    "TESLA": "TSLA",
-    "GOOGLE": "GOOGL",
-    "ALPHABET": "GOOGL",
-    "AMAZON": "AMZN",
-    "META": "META",
-}
-
-_SELL_TERMS = {"SELL", "VENDI", "VENDERE", "VENDO", "LIQUIDA", "LIQUIDARE", "RIDUCI", "RIDURRE"}
-_BUY_TERMS = {"BUY", "COMPRA", "COMPRARE", "ACQUISTA", "ACQUISTARE"}
-_RISK_ON_TERMS = {"PIU RISCHIO", "PIÙ RISCHIO", "PIU' RISCHIO", "RISCHIO ALTO", "AGGRESSIVO", "RISK ON", "MORE RISK"}
-_RISK_OFF_TERMS = {"MENO RISCHIO", "CONSERVATIVO", "CONSERVATIVA", "RISK OFF", "LESS RISK", "RIDURRE RISCHIO"}
-_NEWS_TERMS = {"NEWS", "NOTIZIA", "NOTIZIE", "LEGGI", "READ", "ARTICOLO", "HEADLINE"}
-_AVOID_TERMS = {"EVITA", "NON COMPRARE", "NON ACQUISTARE", "AVOID"}
 
 
 @dataclass(frozen=True)
@@ -42,103 +22,108 @@ def parse_human_intent(notes: list[str]) -> HumanIntent:
     text = clean_text(" ".join(notes), max_chars=4000)
     if not text:
         return HumanIntent([], [])
-    upper = text.upper()
+
     intents: list[str] = []
     requested_action: str | None = None
-    risk_preference: str | None = None
-    impact_topic = _impact_topic(text)
-    is_conditional_sell = bool(impact_topic) and _contains_any_word(upper, _SELL_TERMS)
+    tickers: list[str] = []
+    upper = text.upper()
+    risk_preference = _risk_preference(upper)
+    impact_topic = _extract_impact_topic(text)
 
-    if is_conditional_sell:
-        intents.extend(["conditional_sell", "position_sweep"])
-    elif _is_open_position_sweep(upper):
-        intents.extend(["sell", "position_sweep"])
-    elif _contains_any_word(upper, _SELL_TERMS):
+    has_sell = _has_word(upper, "SELL") or _has_word(upper, "VENDI") or _has_word(upper, "VENDERE")
+    has_buy = _has_word(upper, "BUY") or _has_word(upper, "COMPRA") or _has_word(upper, "ACQUISTA")
+    has_cancel = _has_word(upper, "CANCEL") or _has_word(upper, "ANNULLA") or _has_word(upper, "UNDO")
+
+    if has_cancel:
+        intents.append("cancel")
+    if has_sell and not has_cancel:
         intents.append("sell")
-        requested_action = "SELL"
-    if _contains_any_word(upper, _BUY_TERMS):
+        if impact_topic:
+            intents.append("conditional_sell")
+        if _is_position_sweep_request(upper):
+            intents.append("position_sweep")
+    if has_buy and not has_cancel:
         intents.append("buy")
-        requested_action = requested_action or "BUY"
-    if any(term in upper for term in _AVOID_TERMS):
-        intents.append("avoid")
-    if any(term in upper for term in _NEWS_TERMS):
+    if _has_news_request(upper):
         intents.append("news_request")
-    if any(term in upper for term in _RISK_ON_TERMS):
-        intents.append("risk_on")
-        risk_preference = "risk_on"
-    if any(term in upper for term in _RISK_OFF_TERMS):
-        intents.append("risk_off")
-        risk_preference = "risk_off"
+    if risk_preference:
+        intents.append(risk_preference)
 
-    ticker_text = _remove_impact_topic(upper, impact_topic)
-    tickers = _mentioned_tickers(ticker_text)
     summary_parts = []
     if requested_action:
         summary_parts.append(f"requested_action={requested_action}")
     if risk_preference:
         summary_parts.append(f"risk_preference={risk_preference}")
-    if tickers:
-        summary_parts.append("tickers=" + ",".join(tickers))
     if impact_topic:
         summary_parts.append(f"impact_topic={impact_topic}")
-    summary = "; ".join(summary_parts) if summary_parts else "Human input contains context but no explicit trade intent."
+    if tickers:
+        summary_parts.append("tickers=" + ",".join(tickers))
+    summary = "; ".join(summary_parts) if summary_parts else "Human input requires LLM interpretation or is advisory context."
     return HumanIntent(_dedupe(intents), tickers, requested_action, risk_preference, impact_topic, summary)
 
 
-def _mentioned_tickers(upper_text: str) -> list[str]:
-    ignored = {
-        "ALL",
-        "AND",
-        "BY",
-        "CRYSIS",
-        "DROP",
-        "GAS",
-        "HOLD",
-        "NEWS",
-        "OIL",
-        "OPEN",
-        "OR",
-        "POSITIONS",
-        "POSITION",
-        "WAIT",
-        "BUY",
-        "SELL",
-        *_ALIASES.keys(),
-    }
-    tickers = [symbol for symbol in _SYMBOL_RE.findall(upper_text) if symbol not in ignored]
-    for alias, symbol in _ALIASES.items():
-        if alias in upper_text:
-            tickers.append(symbol)
-    return _dedupe(tickers)
+def split_compound_note(note: str) -> list[str]:
+    cleaned = clean_text(note, max_chars=2000)
+    if not cleaned:
+        return []
+    return [cleaned]
 
 
-def _contains_any_word(upper_text: str, terms: set[str]) -> bool:
-    return any(re.search(rf"\b{re.escape(term)}\b", upper_text) for term in terms)
+def _extract_impact_topic(text: str) -> str | None:
+    patterns = [
+        r"\b(?:related\s+or\s+impacted|related|impacted)\s+by\s+(?P<topic>.+)$",
+        r"\b(?:because\s+of|due\s+to)\s+(?P<topic>.+)$",
+        r"\b(?:a causa di|per via di|colpiti da|impattati da)\s+(?P<topic>.+)$",
+    ]
+    for pattern in patterns:
+        match = _search(pattern, text)
+        if not match:
+            continue
+        topic = clean_text(match.group("topic").strip(" .,:;"), max_chars=240)
+        return topic.lower() if topic else None
+    return None
 
 
-def _impact_topic(text: str) -> str | None:
-    match = re.search(r"\b(?:related|impacted)\s+by\s+(.+)$", text, flags=re.IGNORECASE)
-    if not match:
-        return None
-    topic = clean_text(match.group(1), max_chars=240).strip(" .")
-    return topic or None
-
-
-def _is_open_position_sweep(upper_text: str) -> bool:
-    return _contains_any_word(upper_text, _SELL_TERMS) and (
-        "ALL OPEN POSITIONS" in upper_text
-        or "ALL POSITIONS" in upper_text
-        or "TUTTE LE POSIZIONI" in upper_text
+def _is_position_sweep_request(upper_text: str) -> bool:
+    return any(
+        phrase in upper_text
+        for phrase in (
+            "ALL POSITIONS",
+            "ALL OPEN POSITIONS",
+            "EVERY POSITION",
+            "EVERY OPEN POSITION",
+            "TUTTE LE POSIZIONI",
+            "TUTTE POSIZIONI",
+            "LIQUIDA TUTTO",
+            "LIQUIDATE EVERYTHING",
+        )
     )
 
 
-def _remove_impact_topic(upper_text: str, impact_topic: str | None) -> str:
-    if not impact_topic:
-        return upper_text
-    return upper_text.replace(impact_topic.upper(), "")
+def _risk_preference(upper_text: str) -> str | None:
+    if "RISK ON" in upper_text or "MORE RISK" in upper_text or "PIU RISCHIO" in upper_text or "PIÙ RISCHIO" in upper_text:
+        return "risk_on"
+    if "RISK OFF" in upper_text or "LESS RISK" in upper_text or "MENO RISCHIO" in upper_text:
+        return "risk_off"
+    return None
 
 
-def _dedupe(items: list[str]) -> list[str]:
+def _has_news_request(upper_text: str) -> bool:
+    return any(word in upper_text for word in ("NEWS", "NOTIZIE", "READ", "LEGGI", "HEADLINE"))
+
+
+def _has_word(upper_text: str, word: str) -> bool:
+    padded = f" {upper_text} "
+    return f" {word} " in padded
+
+
+def _search(pattern: str, text: str):
+    import re
+
+    return re.search(pattern, text, flags=re.IGNORECASE)
+
+
+def _dedupe(items) -> list[str]:
     result: list[str] = []
     for item in items:
         if item not in result:

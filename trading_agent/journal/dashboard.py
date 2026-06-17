@@ -16,6 +16,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     stats = _stats(rows)
     details_json = json.dumps([_details_payload(row) for row in display_rows], ensure_ascii=False)
     table_rows = "\n".join(_render_row(index, row) for index, row in enumerate(display_rows))
+    human_events_html = _render_human_events(rows)
 
     document = f"""<!doctype html>
 <html lang="en">
@@ -106,6 +107,95 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     }}
     .metric strong {{ font-size: 22px; line-height: 1.15; }}
     .metric .split {{ display: flex; gap: 8px; flex-wrap: wrap; font-size: 16px; font-weight: 700; }}
+    .human-panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow-soft);
+      margin: 0 0 16px;
+      overflow: hidden;
+    }}
+    .human-panel h2 {{
+      font-size: 14px;
+      margin: 0;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--soft-line);
+      color: #344054;
+    }}
+    .human-list {{
+      max-height: 330px;
+      overflow: auto;
+    }}
+    .human-card {{
+      border-bottom: 1px solid var(--soft-line);
+      font-size: 13px;
+      background: #fff;
+    }}
+    .human-card:last-child {{ border-bottom: 0; }}
+    .human-card summary {{
+      list-style: none;
+      cursor: pointer;
+      padding: 10px 12px;
+    }}
+    .human-card summary::-webkit-details-marker {{ display: none; }}
+    .human-card summary::before {{
+      content: "+";
+      display: inline-grid;
+      place-items: center;
+      width: 18px;
+      height: 18px;
+      border: 1px solid var(--line);
+      border-radius: 50%;
+      margin-right: 8px;
+      color: #344054;
+      font-weight: 700;
+      font-size: 12px;
+    }}
+    .human-card[open] summary::before {{ content: "-"; }}
+    .human-summary-main {{
+      display: inline;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }}
+    .human-summary-sub {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin: 5px 0 0 28px;
+      overflow-wrap: anywhere;
+    }}
+    .human-card-body {{
+      padding: 0 12px 12px 40px;
+    }}
+    .human-steps {{ display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 6px; }}
+    .human-step-chip {{
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: #f7f8fa;
+      color: #344054;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .human-meta {{ display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 6px; }}
+    .human-chip {{
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 7px;
+      background: #fff;
+      color: #344054;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .human-chip.intent {{ border-color: #cfe2ff; background: #f5f9ff; color: #1769aa; }}
+    .human-chip.target {{ border-color: #b7e4c7; background: #f0f9f3; color: #147d4f; }}
+    .human-chip.status {{ border-color: #d9dee7; background: #f7f8fa; color: #344054; }}
+    .human-detail {{ color: #344054; margin-top: 3px; overflow-wrap: anywhere; }}
+    .human-detail span {{ color: var(--muted); font-size: 12px; font-weight: 700; margin-right: 4px; }}
     .table-wrap {{
       background: var(--panel);
       border: 1px solid var(--line);
@@ -234,6 +324,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     .outcome-badge.success {{ background: #eef6f1; color: #147d4f; }}
     .outcome-badge.failed {{ background: #fff1f0; color: #b42318; }}
     .outcome-badge.neutral {{ background: #f1f4f8; color: #344054; }}
+    .outcome-badge.cancelled {{ background: #fef3c7; color: #92400e; text-decoration: line-through; }}
     .signal-stack {{ display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }}
     .signal-pill {{
       display: inline-flex;
@@ -251,6 +342,10 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     .signal-pill.good {{ border-color: #b7e4c7; background: #f0f9f3; color: #147d4f; }}
     .signal-pill.warn {{ border-color: #fed7aa; background: #fff7ed; color: #b54708; }}
     .signal-pill.muted {{ color: var(--muted); }}
+    .signal-pill.cancelled {{ border-color: #fbbf24; background: #fffbeb; color: #92400e; }}
+    .signal-pill.retry {{ border-color: #93c5fd; background: #eff6ff; color: #1e40af; }}
+    .signal-pill.failed {{ border-color: #fca5a5; background: #fef2f2; color: #991b1b; }}
+    .signal-pill.reversal {{ border-color: #c4b5fd; background: #f5f3ff; color: #5b21b6; }}
     .summary-signals {{ margin-top: 8px; }}
     dialog {{
       width: min(820px, calc(100% - 28px));
@@ -394,7 +489,9 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
       <div class="metric"><span>Actions</span><strong class="split"><b>BUY {stats["actions"].get("BUY", 0)}</b><b>SELL {stats["actions"].get("SELL", 0)}</b><b>HOLD {stats["actions"].get("HOLD", 0)}</b><b>WAIT {stats["actions"].get("WAIT", 0)}</b></strong></div>
       <div class="metric"><span>Guardrails</span><strong>{stats["guardrails"]}</strong></div>
       <div class="metric"><span>Failures / retries</span><strong>{stats["failures"]} / {stats["retries"]}</strong></div>
+      <div class="metric"><span>Human messages</span><strong>{stats["human_event_count"]}</strong></div>
     </section>
+    {human_events_html}
     <section class="toolbar" aria-label="Journal controls">
       <div class="filter-group">
         <button class="filter-button active" type="button" data-filter="all" onclick="filterRows('all', this)">All</button>
@@ -535,6 +632,7 @@ def _cycle_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     cycle_rows = _cycle_rows(rows)
     stage_rows = [row for row in rows if row.get("entry_type") == "stage"]
+    human_event_rows = [row for row in rows if row.get("entry_type") == "human_event"]
     timeline_rows = cycle_rows or rows
     actions = Counter(row.get("action", "UNKNOWN") for row in cycle_rows)
     tickers = sorted({row.get("ticker", "-") for row in rows})
@@ -570,6 +668,7 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "actions": actions,
         "cycle_count": len(cycle_rows),
         "stage_count": len(stage_rows),
+        "human_event_count": len(human_event_rows),
         "tickers": ", ".join(tickers) if tickers else "-",
         "run_summary": run_summary,
         "run_summary_short": run_summary_short,
@@ -586,6 +685,172 @@ def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "recovery_class": "warn" if guardrails or fallbacks or retries else "good",
         "health_class": "warn" if failures else "good",
     }
+
+
+def _render_human_events(rows: list[dict[str, Any]]) -> str:
+    events = [row for row in rows if row.get("entry_type") == "human_event"]
+    if not events:
+        return ""
+    groups = _group_human_events(events)
+    items = "\n".join(_render_human_event_group(group, is_latest=index == len(groups[-8:]) - 1) for index, group in enumerate(groups[-8:]))
+    return f"""
+    <section class="human-panel" aria-label="Human message timeline">
+      <h2>Human message timeline</h2>
+      <div class="human-list">{items}</div>
+    </section>"""
+
+
+def _group_human_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in events:
+        key = str(row.get("note_id") or row.get("instruction_id") or row.get("timestamp") or len(order))
+        if key not in groups:
+            groups[key] = {"events": [], "details": {}, "tickers": [], "instruction_ids": []}
+            order.append(key)
+        group = groups[key]
+        group["events"].append(row)
+        ticker = str(row.get("ticker") or "")
+        if ticker and ticker != "HUMAN" and ticker not in group["tickers"]:
+            group["tickers"].append(ticker)
+        instruction_id = str(row.get("instruction_id") or "")
+        if instruction_id and instruction_id not in group["instruction_ids"]:
+            group["instruction_ids"].append(instruction_id)
+        details = row.get("details")
+        if isinstance(details, dict):
+            group["details"].update({key: value for key, value in details.items() if value is not None})
+    return [groups[key] for key in order]
+
+
+def _render_human_event_group(group: dict[str, Any], *, is_latest: bool) -> str:
+    events = group.get("events") or []
+    first = events[0] if events else {}
+    latest = events[-1] if events else {}
+    timestamp = _format_datetime(str(latest.get("timestamp", "-")))
+    note = str(first.get("note", "-"))
+    details = group.get("details") or {}
+    statuses = [str(row.get("status", "-")) for row in events]
+    status_summary = _human_status_summary(statuses)
+    summary_row = {
+        **latest,
+        "status": statuses[-1] if statuses else latest.get("status", "-"),
+        "ticker": ", ".join(group.get("tickers") or []) or latest.get("ticker", "HUMAN"),
+    }
+    instruction_id = ", ".join(group.get("instruction_ids") or []) or "-"
+    meta = _human_event_meta(summary_row, details)
+    detail_lines = _human_event_detail_lines(details)
+    open_attr = " open" if is_latest else ""
+    return f"""
+      <details class="human-card"{open_attr}>
+        <summary>
+          <span class="human-summary-main">{_e(note)}</span>
+          <span class="human-summary-sub">{_e(status_summary)} | {_e(timestamp)} | instruction {_e(instruction_id)}</span>
+        </summary>
+        <div class="human-card-body">
+          <div class="human-meta">{meta}</div>
+          <div class="human-steps">{_human_status_steps(statuses)}</div>
+          {detail_lines}
+        </div>
+      </details>"""
+
+
+def _human_status_summary(statuses: list[str]) -> str:
+    cleaned = [status for status in statuses if status and status != "-"]
+    if not cleaned:
+        return "No status"
+    if len(cleaned) == 1:
+        return f"Latest {cleaned[-1]}"
+    return f"{len(cleaned)} updates; latest {cleaned[-1]}"
+
+
+def _human_status_steps(statuses: list[str]) -> str:
+    cleaned = [status for status in statuses if status]
+    return "".join(f'<span class="human-step-chip">{_e(status)}</span>' for status in cleaned)
+
+
+def _human_event_meta(row: dict[str, Any], details: Any) -> str:
+    detail = details if isinstance(details, dict) else {}
+    chips = [f'<span class="human-chip status">{_e(row.get("status", "-"))}</span>']
+    if detail.get("intent_type"):
+        chips.append(f'<span class="human-chip intent">{_e(detail.get("intent_type"))}</span>')
+    ticker = str(row.get("ticker") or "")
+    if ticker and ticker != "HUMAN":
+        chips.append(f'<span class="human-chip target">target {_e(ticker)}</span>')
+    if detail.get("confidence") is not None:
+        chips.append(f'<span class="human-chip">confidence {_e(_format_confidence(detail.get("confidence")))}</span>')
+    if detail.get("topic"):
+        chips.append(f'<span class="human-chip">topic {_e(detail.get("topic"))}</span>')
+    if detail.get("reason"):
+        chips.append(f'<span class="human-chip">{_e(detail.get("reason"))}</span>')
+    return "".join(chips)
+
+
+def _human_event_detail_lines(details: Any) -> str:
+    detail = details if isinstance(details, dict) else {}
+    lines: list[str] = []
+    rationale = detail.get("rationale")
+    if rationale:
+        lines.append(_human_detail("Rationale", str(rationale)))
+    risk_profile = detail.get("human_risk_profile")
+    if isinstance(risk_profile, dict):
+        lines.append(
+            _human_detail(
+                "Risk profile",
+                (
+                    f"{risk_profile.get('risk_preference', 'neutral')}; "
+                    f"buy {_format_confidence(risk_profile.get('buy_aggressiveness'))}; "
+                    f"sell {_format_confidence(risk_profile.get('sell_aggressiveness'))}; "
+                    f"{risk_profile.get('rationale', '')}"
+                ).strip(),
+            )
+        )
+    risk_limits = detail.get("risk_limits")
+    if isinstance(risk_limits, dict):
+        lines.append(
+            _human_detail(
+                "Risk limits",
+                f"max buy {risk_limits.get('max_buy_quantity', '-')}; max sell {risk_limits.get('max_sell_quantity', '-')}",
+            )
+        )
+    planned = detail.get("planned_targets")
+    if isinstance(planned, list) and planned:
+        lines.append(_human_detail("Planned positions", _format_human_target_list(planned)))
+    excluded = detail.get("excluded_tickers")
+    if isinstance(excluded, list) and excluded:
+        lines.append(_human_detail("Excluded positions", _format_human_target_list(excluded)))
+    buyable = detail.get("buyable_universe")
+    if buyable:
+        lines.append(_human_detail("Buy universe", ", ".join(str(item) for item in buyable)))
+    sellable = detail.get("sellable_open_positions")
+    if sellable:
+        lines.append(_human_detail("Sellable positions", ", ".join(str(item) for item in sellable)))
+    return "".join(lines)
+
+
+def _human_detail(label: str, value: str) -> str:
+    return f'<div class="human-detail"><span>{_e(label)}:</span>{_e(value)}</div>'
+
+
+def _format_human_target_list(items: list[Any]) -> str:
+    parts: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            ticker = str(item.get("ticker") or item.get("symbol") or "-").upper()
+            sequence_index = item.get("sequence_index")
+            sequence_total = item.get("sequence_total")
+            sequence = f" {sequence_index}/{sequence_total}" if sequence_index and sequence_total else ""
+            rationale = str(item.get("rationale") or "").strip()
+            parts.append(f"{ticker}{sequence}: {rationale}" if rationale else f"{ticker}{sequence}")
+        else:
+            parts.append(str(item))
+    return "; ".join(parts)
+
+
+def _format_confidence(value: Any) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def _render_row(index: int, row: dict[str, Any]) -> str:
@@ -767,7 +1032,7 @@ def _data_quality_pill(row: dict[str, Any]) -> str:
 
 
 def _technical_pill(row: dict[str, Any]) -> str:
-    indicators = ((row.get("market_snapshot") or {}).get("technical_indicators") or {})
+    indicators = (row.get("market_snapshot") or {}).get("technical_indicators") or {}
     confidence = indicators.get("confidence", "none")
     if confidence in {"high", "medium"}:
         return '<span class="signal-pill good">Technicals: ready</span>'
@@ -799,10 +1064,23 @@ def _signals_html(row: dict[str, Any]) -> str:
     ]
     if row.get("guardrails_triggered"):
         pieces.append('<span class="signal-pill warn">Guardrail</span>')
+    if row.get("cancelled_by"):
+        pieces.append(f'<span class="signal-pill cancelled" title="Cancelled by instruction {row["cancelled_by"]}">CANCELLATO</span>')
+    retry_count = int(row.get("retry_count") or 0)
+    if retry_count > 0:
+        pieces.append(f'<span class="signal-pill retry" title="Retry attempt {retry_count}">RETRY {retry_count}</span>')
+    failure_type = row.get("failure_type")
+    if failure_type:
+        pieces.append(f'<span class="signal-pill failed" title="Classified failure type">{failure_type}</span>')
+    reversal_of = row.get("reversal_of")
+    if reversal_of:
+        pieces.append(f'<span class="signal-pill reversal" title="Reversal of instruction {reversal_of}">REVERSAL</span>')
     return '<div class="signal-stack">' + "".join(pieces) + "</div>"
 
 
 def _outcome_badge_html(row: dict[str, Any]) -> str:
+    if row.get("cancelled_by"):
+        return '<span class="outcome-badge cancelled">Cancelled</span>'
     execution = row.get("execution_result") or {}
     status = str(execution.get("status", row.get("outcome", ""))).lower()
     if status in {"filled", "skipped"}:
@@ -927,12 +1205,12 @@ def _portfolio_delta_html(row: dict[str, Any]) -> str:
     delta_label = _cash_movement_label(row, delta)
     positions = _positions_count((after or {}).get("positions"))
     value = _safe_float((after or {}).get("portfolio_value"))
-    value_line = f'Portfolio {_e(_format_money(value))}<br>' if value is not None else ""
+    value_line = f"Portfolio {_e(_format_money(value))}<br>" if value is not None else ""
     return (
         '<div class="portfolio-mini">'
         f'<span class="portfolio-delta{delta_class} money">{_e(delta_label)}</span>'
         f'<div class="portfolio-pos">{value_line}Cash {_e(_format_money(cash))}, Pos {positions}</div>'
-        '</div>'
+        "</div>"
     )
 
 
@@ -1078,10 +1356,7 @@ def _timestamp_html(value: str) -> str:
     parsed = _parse_datetime(value)
     if not parsed:
         return _e(value)
-    return (
-        f'<div class="time-main">{parsed.strftime("%d/%m %H:%M:%S")}</div>'
-        f'<div class="time-sub">{parsed.strftime("%Y")} UTC</div>'
-    )
+    return f'<div class="time-main">{parsed.strftime("%d/%m %H:%M:%S")}</div>' f'<div class="time-sub">{parsed.strftime("%Y")} UTC</div>'
 
 
 def _format_datetime(value: str) -> str:

@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from trading_agent.core import (
+    HumanIntent,
     JournalEntry,
     LlmClient,
     MarketSnapshot,
@@ -88,6 +89,7 @@ def react_analyst_decision(
     position_sizing = build_position_sizing_context(snapshot, portfolio)
     parsed_human_intent = parse_human_intent(human_input or [])
     human_intent_payload = human_intent or parsed_human_intent.to_dict()
+    effective_human_intent = _human_intent_from_payload(human_intent) if human_intent else parsed_human_intent
     final_payload = json.dumps(
         {
             "snapshot": snapshot_payload(snapshot),
@@ -155,7 +157,7 @@ def react_analyst_decision(
             ),
         )
 
-    human_trade_decision = _human_trade_decision(snapshot, parsed, parsed_human_intent, position_sizing, metadata, observations)
+    human_trade_decision = _human_trade_decision(snapshot, parsed, effective_human_intent, position_sizing, metadata, observations)
     if human_trade_decision is not None:
         return human_trade_decision
 
@@ -238,6 +240,18 @@ def _available_tool_names(news_provider=None) -> list[str]:
         "read_news_url",
         *([] if news_provider is None else ["search_market_news"]),
     ]
+
+
+def _human_intent_from_payload(payload: dict[str, Any] | None) -> HumanIntent:
+    payload = payload or {}
+    return HumanIntent(
+        intents=[str(item) for item in payload.get("intents", []) if isinstance(item, str)],
+        tickers=[str(item).upper() for item in payload.get("tickers", []) if isinstance(item, str)],
+        requested_action=payload.get("requested_action"),
+        risk_preference=payload.get("risk_preference"),
+        impact_topic=payload.get("impact_topic"),
+        summary=str(payload.get("summary") or "Resolved human intent."),
+    )
 
 
 def _with_tool_audit(details: dict[str, Any], observations: list[dict[str, Any]]) -> dict[str, Any]:
