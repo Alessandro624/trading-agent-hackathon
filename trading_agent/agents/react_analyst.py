@@ -76,6 +76,36 @@ def react_analyst_decision(
     metadata = llm_metadata(llm_client)
     logger.info("analyst.llm.start ticker=%s mode=react", snapshot.ticker)
 
+    if snapshot.price is None or snapshot.price_confidence in {"low", "none"}:
+        reason = (
+            "Current price is unavailable or unreliable after retry; trading is unsafe "
+            "because the agent cannot size or validate an order without a documented price"
+        )
+        logger.warning(
+            "react.price_guardrail ticker=%s price_confidence=%s",
+            snapshot.ticker,
+            snapshot.price_confidence,
+        )
+        return TradingDecision(
+            ticker=snapshot.ticker,
+            action="HOLD",
+            quantity=0,
+            confidence=0.15,
+            rationale=snapshot_grounded_hold_rationale(snapshot, reason),
+            used_data_sources=snapshot.data_sources,
+            guardrails_triggered=[
+                *snapshot.guardrails_triggered,
+                "guardrail:missing_or_unreliable_price",
+            ],
+            reflection="Automatic safety override: no trade without reliable current price.",
+            llm_metadata=metadata,
+            rationale_details=safe_rationale_details(
+                snapshot,
+                "Safe HOLD because current price is unavailable or unreliable.",
+                [reason, *snapshot.failures],
+            ),
+        )
+
     observations, blocked_tools = _tool_observations(snapshot, recent_entries, llm_client, news_provider)
     for tool_name in blocked_tools:
         logger.warning("react.tool.blocked ticker=%s tool=%s", snapshot.ticker, tool_name)

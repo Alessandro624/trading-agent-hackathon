@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import os
 
 from trading_agent.utils import require_env
 
@@ -18,6 +19,8 @@ class AlpacaMarketDataProvider:
         from alpaca.data.requests import StockLatestTradeRequest
 
         symbol = ticker.upper()
+        if os.getenv("SIMULATE_PRICE_ERROR", "false").lower().strip() in {"1", "true", "yes", "on"}:
+            raise RuntimeError(f"Simulated price API 503 error for {symbol}")
         trades = self.client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))
         trade = trades[symbol] if isinstance(trades, dict) else trades
         return {"ticker": symbol, "price": float(trade.price), "timestamp": trade.timestamp.isoformat()}
