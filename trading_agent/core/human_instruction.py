@@ -205,7 +205,7 @@ def _llm_resolve_note(
 
     sellable_targets = _open_position_targets(watchlist, portfolio)
     buyable_universe = _watchlist_symbols(watchlist)
-    portfolio_payload = portfolio_positions(portfolio)
+    portfolio_payload = _enrich_positions_with_llm(portfolio_positions(portfolio), llm_client)
     pending_payload = _serialize_pending_instructions(pending_instructions or [])
     recent_executed_payload = _serialize_recent_executed_instructions(recent_executed_instructions or [])
 
@@ -323,11 +323,7 @@ def _llm_resolve_note(
         targets = _validate_targets(resolved.get("target_tickers"), sellable_targets)
         excluded_tickers = _validate_targets(resolved.get("excluded_tickers"), sellable_targets)
         if not targets:
-            validation_error = (
-                "no_valid_sellable_targets: "
-                f"requested={','.join(_target_ticker_codes(resolved.get('target_tickers')))} "
-                f"sellable={','.join(sellable_targets)}"
-            )
+            validation_error = "no_valid_sellable_targets: " f"requested={','.join(_target_ticker_codes(resolved.get('target_tickers')))} " f"sellable={','.join(sellable_targets)}"
             logger.info(
                 "human.resolver.llm.reject reason=no_valid_sellable_targets requested=%s sellable=%s",
                 ",".join(_target_ticker_codes(resolved.get("target_tickers"))),
@@ -399,6 +395,20 @@ def _llm_resolve_note(
             resolver_topic=topic,
         )
     ]
+
+
+def _enrich_positions_with_llm(positions: dict, llm_client: Any) -> dict:
+    if not positions or not llm_client:
+        return positions
+    tickers = list(positions.keys())
+    prompt = 'Return ONLY JSON. For each ticker provide a one-sentence business description focusing on energy consumption, supply chain, and macro exposure. Schema: {"TICKER": "description", ...}'
+    try:
+        raw = llm_client.complete_json(prompt, ", ".join(tickers))
+        descriptions = json.loads(raw)
+    except Exception as e:
+        return positions
+
+    return {symbol: {**data, "business": descriptions.get(symbol, "")} for symbol, data in positions.items()}
 
 
 def _serialize_pending_instructions(instructions: list[HumanInstruction]) -> list[dict[str, Any]]:
@@ -508,11 +518,7 @@ def _forced_action_instructions(
     rationale_global: str | None,
 ) -> list[HumanInstruction]:
     raw_targets = resolved.get("target_tickers")
-    targets = (
-        _validate_forced_buy_targets(raw_targets, buyable_universe, ticker_validator)
-        if intent_type == "forced_buy"
-        else _validate_targets(raw_targets, sellable_targets)
-    )
+    targets = _validate_forced_buy_targets(raw_targets, buyable_universe, ticker_validator) if intent_type == "forced_buy" else _validate_targets(raw_targets, sellable_targets)
     if not targets or confidence < 0.6:
         logger.info(
             "human.resolver.llm.reject reason=forced_action_missing_ticker_or_confidence intent_type=%s confidence=%.2f",
@@ -528,9 +534,7 @@ def _forced_action_instructions(
                     "human_context_requires_resolver",
                     resolver_intent_type="advisory",
                     resolver_confidence=confidence,
-                    resolver_rationale=(
-                        f"{requested} could not be validated as a tradable buy candidate outside the initial buy universe."
-                    ),
+                    resolver_rationale=(f"{requested} could not be validated as a tradable buy candidate outside the initial buy universe."),
                     resolver_topic=topic,
                 )
             ]
