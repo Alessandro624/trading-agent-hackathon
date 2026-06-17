@@ -237,7 +237,7 @@ trading-agent-hackathon/
 │   │
 │   ├── journal/
 │   │   ├── dashboard.py                # Dashboard for a single Journal
-│   │   ├── memory.py                   # 
+│   │   ├── memory.py                   # Memory Handling
 │   │   ├── run_manager.py              # Single Run Manager for Saving and Recalling
 │   │   ├── store.py                    # Journal Storing and Recalling Model
 │   │   └── terminal.py                 # Terminal Inferface API
