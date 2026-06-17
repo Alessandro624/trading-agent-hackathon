@@ -23,7 +23,7 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="10">
+  <meta http-equiv="refresh" content="180">
   <title>Trading Agent Journal</title>
   <style>
     :root {{
