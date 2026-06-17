@@ -13,6 +13,7 @@ from trading_agent.core import (
     TechnicalOpinion,
     TradingDecision,
     parse_analyst_output,
+    parse_human_intent,
     safe_rationale_details,
 )
 from trading_agent.journal import compact_recent_entries
@@ -29,6 +30,7 @@ If risk_assessment.stop_loss_triggered or risk_assessment.take_profit_triggered 
 Use any current position information from the risk assessment/portfolio context before adding exposure or deciding to SELL.
 Do not invent prices, news, indicators, portfolio state, or agent opinions.
 Human input is advisory but important: consider it explicitly, and if you disagree, explain why using validated data and risk limits.
+If human_intent includes conditional_sell, evaluate whether the current ticker is materially exposed to human_intent.impact_topic. SELL only if exposure/impact is justified by validated evidence; otherwise HOLD and explain why.
 Write a dashboard-ready rationale with the final decision, strongest cross-agent evidence, key risks, and data-quality limits.
 """
 
@@ -42,6 +44,7 @@ def decide_from_opinions(
     llm_client: LlmClient,
     retry_policy: RetryPolicy | None = None,
     human_input: list[str] | None = None,
+    human_intent: dict | None = None,
 ) -> TradingDecision:
     metadata = llm_metadata(llm_client)
     if not risk.can_trade:
@@ -58,6 +61,8 @@ def decide_from_opinions(
         )
 
     retry_policy = retry_policy or RetryPolicy(max_attempts=2)
+    parsed_human_intent = parse_human_intent(human_input or [])
+    human_intent_payload = human_intent or parsed_human_intent.to_dict()
     payload = json.dumps(
         {
             "snapshot": {
@@ -74,6 +79,7 @@ def decide_from_opinions(
             "risk_assessment": asdict(risk),
             "recent_journal": compact_recent_entries(recent_entries, ticker=snapshot.ticker),
             "human_input": human_input or [],
+            "human_intent": human_intent_payload,
         },
         default=str,
     )
@@ -108,6 +114,10 @@ def decide_from_opinions(
             llm_metadata=metadata,
             rationale_details=safe_rationale_details(snapshot, "Decision Manager validation failed.", errors),
         )
+
+    deterministic_human_trade = _deterministic_human_trade_decision(snapshot, parsed, risk, parsed_human_intent)
+    if deterministic_human_trade is not None:
+        return deterministic_human_trade
 
     action_limit = _action_limit(parsed.action, risk)
     if parsed.action in {"BUY", "SELL"} and parsed.quantity > action_limit:
@@ -162,3 +172,75 @@ def _action_limit(action: str, risk: RiskAssessment) -> int:
     if action == "SELL":
         return risk.max_sell_quantity
     return 0
+
+
+def _deterministic_human_trade_decision(
+    snapshot: MarketSnapshot,
+    parsed: AnalystDecisionOutput,
+    risk: RiskAssessment,
+    human_intent,
+) -> TradingDecision | None:
+    action: str | None = None
+    quantity = 0
+    reasons: list[str] = []
+    guardrails: list[str] = []
+
+    if human_intent.requested_action == "BUY" and _human_intent_applies_to_ticker(human_intent, snapshot.ticker):
+        action = "BUY"
+        quantity = min(1, risk.max_buy_quantity)
+        reasons.append("Human input requested BUY")
+        guardrails.append("guardrail:human_buy_intent")
+
+    if human_intent.requested_action == "SELL" and _human_intent_applies_to_ticker(human_intent, snapshot.ticker):
+        action = "SELL"
+        quantity = risk.max_sell_quantity
+        reasons.append("Human input requested SELL")
+        guardrails.append("guardrail:human_sell_intent")
+
+    if action is None and "position_sweep" in human_intent.intents and risk.max_sell_quantity > 0:
+        action = "SELL"
+        quantity = risk.max_sell_quantity
+        reasons.append(_human_position_sweep_reason(snapshot.ticker, human_intent))
+        guardrails.append("guardrail:human_position_sweep_sell")
+
+    if risk.stop_loss_triggered:
+        action = action or "SELL"
+        quantity = quantity or risk.max_sell_quantity
+        reasons.append("stop-loss risk flag is active")
+        guardrails.append("guardrail:stop_loss_sell")
+    if risk.take_profit_triggered:
+        action = action or "SELL"
+        quantity = quantity or risk.max_sell_quantity
+        reasons.append("take-profit risk flag is active")
+        guardrails.append("guardrail:take_profit_sell")
+
+    if action is None or quantity <= 0 or not reasons:
+        return None
+    return TradingDecision(
+        ticker=snapshot.ticker,
+        action=action,
+        quantity=quantity,
+        confidence=max(parsed.confidence, 0.65),
+        rationale=(
+            "; ".join(reasons) + f". Overriding draft {parsed.action} to {action} within risk limits " f"(max_buy_quantity={risk.max_buy_quantity}, max_sell_quantity={risk.max_sell_quantity})."
+        ),
+        used_data_sources=[*(parsed.used_data_sources or snapshot.data_sources), "risk_assessment", "human_intent"],
+        guardrails_triggered=guardrails,
+        rationale_details={
+            **(parsed.rationale_details or {}),
+            "summary": "; ".join(reasons),
+            "human_intent": human_intent.to_dict(),
+            "human_impact_topic": human_intent.impact_topic,
+            "human_selected_ticker": snapshot.ticker,
+            "risk_flags": risk.risk_flags,
+        },
+    )
+
+
+def _human_intent_applies_to_ticker(human_intent, ticker: str) -> bool:
+    return not human_intent.tickers or ticker.upper() in human_intent.tickers
+
+
+def _human_position_sweep_reason(ticker: str, human_intent) -> str:
+    topic = human_intent.impact_topic or "the user's broad risk topic"
+    return f"Human input requested a broad SELL sweep for open positions potentially impacted by {topic}. " f"Selected {ticker.upper()} because it is an open position in the human-instruction sweep"

@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from trading_agent.core.data_hygiene import clean_text
+from trading_agent.core.human_intent import parse_human_intent
 from trading_agent.core.portfolio import position_for
+from trading_agent.core.portfolio import positions as portfolio_positions
 from trading_agent.adapters.ticker_provider import TickerProvider
 
 _SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}\b")
@@ -52,6 +54,15 @@ def select_ticker(
     symbols = parse_watchlist(watchlist or ([fallback] if fallback else []))
     if not symbols:
         raise ValueError("watchlist must include at least one valid ticker")
+    human_intent = parse_human_intent(human_input)
+    if human_intent.requested_action in {"BUY", "SELL"} and human_intent.tickers:
+        ticker = human_intent.tickers[-1]
+        return TickerSelection(
+            ticker=ticker,
+            reason="human_forced_action",
+            rationale=_selection_rationale(ticker, f"Human input forced {human_intent.requested_action} for this ticker.", human_input, portfolio),
+            mentioned_tickers=human_intent.tickers,
+        )
     mentioned = _mentioned_tickers(human_input, symbols)
     if mentioned:
         ticker = mentioned[-1]
@@ -60,6 +71,15 @@ def select_ticker(
             reason="human_input",
             rationale=_selection_rationale(ticker, "Human input mentioned this ticker.", human_input, portfolio),
             mentioned_tickers=mentioned,
+        )
+    positioned_symbols = _positioned_watchlist_symbols(symbols, portfolio)
+    if "position_sweep" in human_intent.intents and positioned_symbols:
+        ticker = positioned_symbols[cycle_index % len(positioned_symbols)]
+        return TickerSelection(
+            ticker=ticker,
+            reason="human_position_sweep",
+            rationale=_selection_rationale(ticker, "Human input requested a sweep of impacted open positions.", human_input, portfolio),
+            mentioned_tickers=[],
         )
     ticker = symbols[cycle_index % len(symbols)]
     return TickerSelection(
@@ -86,6 +106,11 @@ def _mentioned_tickers(human_input: list[str], watchlist: list[str]) -> list[str
     return mentioned
 
 
+def _positioned_watchlist_symbols(watchlist: list[str], portfolio: dict[str, Any] | None) -> list[str]:
+    open_positions = portfolio_positions(portfolio)
+    return [symbol for symbol in watchlist if open_positions.get(symbol, {}).get("qty", 0.0) > 0]
+
+
 def _selection_rationale(
     ticker: str,
     reason: str,
@@ -107,7 +132,7 @@ def select_ticker_v2(
     cycle_index: int,
     fallback: str | None = None,
 ) -> TickerSelection:
-    
+
     ticker_provider: TickerProvider = TickerProvider()
 
     tickers_list = ticker_provider.get_tickers_with_info(watchlist)
@@ -121,7 +146,7 @@ def select_ticker_v2(
             rationale=_selection_rationale(ticker, "Human input mentioned this ticker.", human_input, portfolio),
             mentioned_tickers=mentioned,
         )
-    
+
     ticker = tickers_list[0]
     return TickerSelection(
         ticker=ticker,

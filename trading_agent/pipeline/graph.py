@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-from trading_agent.core import BrokerClient, LlmClient, MarketDataProvider, NewsProvider, TradingDecision, is_trade_action, utc_now_iso
+from trading_agent.core import BrokerClient, LlmClient, MarketDataProvider, NewsProvider, TradingDecision, is_trade_action, parse_human_intent, utc_now_iso
 from trading_agent.journal import JournalStore
 from trading_agent.agents import (
     assess_risk,
@@ -32,6 +32,7 @@ class State(TypedDict, total=False):
     journal_entry: Any
     cycle_started_at: str
     human_input: list[str]
+    human_intent: dict[str, Any]
 
 
 def build_graph(
@@ -129,6 +130,7 @@ def build_multi_agent_graph(
                         state["risk_assessment"],
                         llm_client,
                         human_input=state.get("human_input", []),
+                        human_intent=state.get("human_intent"),
                     )
                 }
             )
@@ -229,6 +231,7 @@ def run_cycle(
     symbol = ticker.upper()
     started_at = cycle_started_at or utc_now_iso()
     human_notes = human_input or []
+    human_intent = parse_human_intent(human_notes).to_dict()
     logger.info("cycle.start ticker=%s started_at=%s", symbol, started_at)
     if journal is not None:
         journal.append_stage(
@@ -237,7 +240,7 @@ def run_cycle(
             status="started",
             message="Cycle started.",
             cycle_started_at=started_at,
-            details={"human_input": human_notes},
+            details={"human_input": human_notes, "human_intent": human_intent},
         )
     try:
         state = agent.invoke(
@@ -246,6 +249,7 @@ def run_cycle(
                 "recent_entries": recent_entries,
                 "cycle_started_at": started_at,
                 "human_input": human_notes,
+                "human_intent": human_intent,
             }
         )
     except Exception as error:
@@ -303,6 +307,7 @@ def _single_agent_analysis(
         portfolio=portfolio,
         news_provider=news_provider,
         human_input=state.get("human_input", []),
+        human_intent=state.get("human_intent"),
     )
     return state
 

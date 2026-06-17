@@ -11,6 +11,7 @@ from trading_agent.core import (
     TradingDecision,
     build_position_sizing_context,
     parse_analyst_output,
+    parse_human_intent,
     rationale_snapshot_mismatches,
     safe_rationale_details,
     snapshot_grounded_hold_rationale,
@@ -44,6 +45,9 @@ Use the tool observations and return only valid JSON matching:
 {"action":"BUY|SELL|HOLD|WAIT","quantity":0,"confidence":0.0,"rationale":"...","used_data_sources":["..."],"rationale_details":{"summary":"...","evidence":["..."],"risks":["..."],"data_quality":"..."}}
 Do not invent prices, news, technical indicators, failures, guardrails, or portfolio state.
 Human input is advisory but important: consider it explicitly, and if you disagree, explain why using validated data and risk limits.
+Human intent is pre-parsed from the notes. If human_intent.requested_action is SELL for the current ticker and position_sizing.max_sell_quantity > 0, prefer SELL unless validated data gives a clear reason not to.
+If human_intent includes conditional_sell, evaluate whether the current ticker is materially exposed to human_intent.impact_topic. SELL only if exposure/impact is justified by validated evidence; otherwise HOLD and explain why.
+If human_intent.risk_preference is risk_on, you may use a higher BUY/SELL quantity within the valid risk limit. If it is risk_off, prefer lower quantity or SELL/HOLD.
 If observations reveal a temporary data gap, pending market condition, or specific news/source that should be checked in a later cycle, choose WAIT.
 If observations reveal a final no-trade conclusion, contradiction, or unsafe setup, choose HOLD.
 NewsAPI content is a short/truncated preview; treat full article body as available only when read_news_url succeeded.
@@ -65,6 +69,7 @@ def react_analyst_decision(
     portfolio: dict | None = None,
     news_provider=None,
     human_input: list[str] | None = None,
+    human_intent: dict[str, Any] | None = None,
 ) -> TradingDecision:
     retry_policy = retry_policy or RetryPolicy(max_attempts=2)
     metadata = llm_metadata(llm_client)
@@ -80,12 +85,16 @@ def react_analyst_decision(
     logger.info("react.tools.completed ticker=%s tools=%s", snapshot.ticker, ",".join(used_tools) or "none")
 
     errors: list[str] = []
+    position_sizing = build_position_sizing_context(snapshot, portfolio)
+    parsed_human_intent = parse_human_intent(human_input or [])
+    human_intent_payload = human_intent or parsed_human_intent.to_dict()
     final_payload = json.dumps(
         {
             "snapshot": snapshot_payload(snapshot),
             "recent_journal": compact_recent_entries(recent_entries, ticker=snapshot.ticker),
             "human_input": human_input or [],
-            "position_sizing": build_position_sizing_context(snapshot, portfolio),
+            "human_intent": human_intent_payload,
+            "position_sizing": position_sizing,
             "tool_observations": observations,
         },
         default=str,
@@ -145,6 +154,10 @@ def react_analyst_decision(
                 observations,
             ),
         )
+
+    human_trade_decision = _human_trade_decision(snapshot, parsed, parsed_human_intent, position_sizing, metadata, observations)
+    if human_trade_decision is not None:
+        return human_trade_decision
 
     rationale_details = _with_tool_audit(parsed.rationale_details, observations)
     return TradingDecision(
@@ -234,3 +247,75 @@ def _with_tool_audit(details: dict[str, Any], observations: list[dict[str, Any]]
         "tool_failures": [item for item in observations if item.get("error") or ((item.get("observation") or {}).get("status") == "failed")],
     }
     return enriched
+
+
+def _human_trade_decision(
+    snapshot: MarketSnapshot,
+    parsed,
+    human_intent,
+    position_sizing: dict[str, Any],
+    metadata: dict[str, Any],
+    observations: list[dict[str, Any]],
+) -> TradingDecision | None:
+    max_buy = int(position_sizing.get("max_buy_quantity") or 0)
+    max_sell = int(position_sizing.get("max_sell_quantity") or 0)
+    action: str | None = None
+    quantity = 0
+    summary: str | None = None
+    guardrail: str | None = None
+
+    if human_intent.requested_action == "BUY" and _human_intent_applies_to_ticker(human_intent, snapshot.ticker) and max_buy > 0:
+        action = "BUY"
+        quantity = 1
+        summary = "Human input requested BUY and risk limits allow a conservative purchase."
+        guardrail = "guardrail:human_buy_intent"
+    elif human_intent.requested_action == "SELL" and _human_intent_applies_to_ticker(human_intent, snapshot.ticker) and max_sell > 0:
+        action = "SELL"
+        quantity = max_sell
+        summary = "Human input requested SELL and a current position exists."
+        guardrail = "guardrail:human_sell_intent"
+    elif "position_sweep" in human_intent.intents and max_sell > 0:
+        action = "SELL"
+        quantity = max_sell
+        summary = _human_position_sweep_summary(snapshot.ticker, human_intent)
+        guardrail = "guardrail:human_position_sweep_sell"
+
+    if action is None or quantity <= 0 or summary is None or guardrail is None:
+        return None
+    details = _with_tool_audit(parsed.rationale_details, observations)
+    details.update(
+        {
+            "summary": summary,
+            "human_intent": human_intent.to_dict(),
+            "human_impact_topic": human_intent.impact_topic,
+            "human_selected_ticker": snapshot.ticker,
+            "position_sizing": position_sizing,
+        }
+    )
+    return TradingDecision(
+        ticker=snapshot.ticker,
+        action=action,
+        quantity=quantity,
+        confidence=max(parsed.confidence, 0.65),
+        rationale=(
+            f"{summary} For {snapshot.ticker}, overriding draft {parsed.action} to {action} "
+            f"within risk limits (max_buy_quantity={max_buy}, max_sell_quantity={max_sell})."
+        ),
+        used_data_sources=[*(parsed.used_data_sources or snapshot.data_sources), "human_intent", "react_tools"],
+        guardrails_triggered=[guardrail],
+        reflection="ReAct tools used: " + (", ".join(item["tool"] for item in observations if item.get("tool")) or "none"),
+        llm_metadata=metadata,
+        rationale_details=details,
+    )
+
+
+def _human_intent_applies_to_ticker(human_intent, ticker: str) -> bool:
+    return not human_intent.tickers or ticker.upper() in human_intent.tickers
+
+
+def _human_position_sweep_summary(ticker: str, human_intent) -> str:
+    topic = human_intent.impact_topic or "the user's broad risk topic"
+    return (
+        f"Human input requested a broad SELL sweep for open positions potentially impacted by {topic}. "
+        f"Selected {ticker.upper()} because it is an open position in the human-instruction sweep."
+    )
