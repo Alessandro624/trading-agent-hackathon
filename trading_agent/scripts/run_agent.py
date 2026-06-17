@@ -880,6 +880,7 @@ def run_agent(
                     broker,
                     journal,
                 )
+        render_dashboard(context.journal_path, context.dashboard_path)
         if cycle_index < cycles - 1 and interval_seconds > 0:
             time.sleep(interval_seconds)
     return context
