@@ -1,26 +1,12 @@
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from trading_agent.core.data_hygiene import clean_text
 from trading_agent.core.human_intent import parse_human_intent
 from trading_agent.core.portfolio import position_for
 from trading_agent.core.portfolio import positions as portfolio_positions
-from trading_agent.adapters.ticker_provider import TickerProvider
-
-_SYMBOL_RE = re.compile(r"\b[A-Z]{1,5}\b")
-_ALIASES = {
-    "APPLE": "AAPL",
-    "MICROSOFT": "MSFT",
-    "NVIDIA": "NVDA",
-    "TESLA": "TSLA",
-    "GOOGLE": "GOOGL",
-    "ALPHABET": "GOOGL",
-    "AMAZON": "AMZN",
-    "META": "META",
-}
 
 
 @dataclass(frozen=True)
@@ -28,15 +14,17 @@ class TickerSelection:
     ticker: str
     reason: str
     rationale: str
-    mentioned_tickers: list[str]
+    mentioned_tickers: list[str] = field(default_factory=list)
 
 
-def parse_watchlist(value: str | list[str] | tuple[str, ...]) -> list[str]:
+def parse_watchlist(value: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    if value is None:
+        return []
     raw_items = value.split(",") if isinstance(value, str) else list(value)
     symbols: list[str] = []
     for item in raw_items:
         symbol = clean_text(item, max_chars=16).upper()
-        if not symbol or not re.fullmatch(r"[A-Z]{1,5}", symbol):
+        if not _is_symbol(symbol):
             continue
         if symbol not in symbols:
             symbols.append(symbol)
@@ -44,71 +32,81 @@ def parse_watchlist(value: str | list[str] | tuple[str, ...]) -> list[str]:
 
 
 def select_ticker(
-    watchlist: list[str],
+    watchlist: list[str] | str | None = None,
     *,
     human_input: list[str],
     portfolio: dict[str, Any] | None,
-    cycle_index: int,
+    recent_news: list[dict[str, Any]] | None = None,
+    cycle_index: int = 0,
     fallback: str | None = None,
+    ticker_provider: Any | None = None,
 ) -> TickerSelection:
-    symbols = parse_watchlist(watchlist or ([fallback] if fallback else []))
-    if not symbols:
-        raise ValueError("watchlist must include at least one valid ticker")
+    watchlist_symbols = parse_watchlist(watchlist)
     human_intent = parse_human_intent(human_input)
-    if human_intent.requested_action in {"BUY", "SELL"} and human_intent.tickers:
-        ticker = human_intent.tickers[-1]
-        return TickerSelection(
-            ticker=ticker,
-            reason="human_forced_action",
-            rationale=_selection_rationale(ticker, f"Human input forced {human_intent.requested_action} for this ticker.", human_input, portfolio),
-            mentioned_tickers=human_intent.tickers,
-        )
-    mentioned = _mentioned_tickers(human_input, symbols)
-    if mentioned:
-        ticker = mentioned[-1]
-        return TickerSelection(
-            ticker=ticker,
-            reason="human_input",
-            rationale=_selection_rationale(ticker, "Human input mentioned this ticker.", human_input, portfolio),
-            mentioned_tickers=mentioned,
-        )
-    positioned_symbols = _positioned_watchlist_symbols(symbols, portfolio)
+    positioned_symbols = _open_position_tickers(portfolio)
     if "position_sweep" in human_intent.intents and positioned_symbols:
-        ticker = positioned_symbols[cycle_index % len(positioned_symbols)]
+        candidates = [symbol for symbol in watchlist_symbols if symbol in positioned_symbols] or positioned_symbols
+        ticker = _rank(candidates, ticker_provider) or candidates[cycle_index % len(candidates)]
         return TickerSelection(
             ticker=ticker,
             reason="human_position_sweep",
-            rationale=_selection_rationale(ticker, "Human input requested a sweep of impacted open positions.", human_input, portfolio),
+            rationale=_selection_rationale(ticker, "Human input requested a sweep or review of open positions.", human_input, portfolio),
+            mentioned_tickers=candidates,
+        )
+
+    if positioned_symbols:
+        ticker = _rank(positioned_symbols, ticker_provider) or positioned_symbols[cycle_index % len(positioned_symbols)]
+        return TickerSelection(
+            ticker=ticker,
+            reason="open_position",
+            rationale=_selection_rationale(ticker, "Open position selected for review.", human_input, portfolio),
+            mentioned_tickers=positioned_symbols,
+        )
+
+    if watchlist_symbols:
+        ticker = _rank(watchlist_symbols, ticker_provider) or watchlist_symbols[cycle_index % len(watchlist_symbols)]
+        return TickerSelection(
+            ticker=ticker,
+            reason="watchlist_rotation",
+            rationale=_selection_rationale(ticker, "No open position or explicit human ticker; selecting from current ticker universe.", human_input, portfolio),
             mentioned_tickers=[],
         )
-    ticker = symbols[cycle_index % len(symbols)]
-    return TickerSelection(
-        ticker=ticker,
-        reason="watchlist_rotation",
-        rationale=_selection_rationale(ticker, "No new human ticker mention; rotating watchlist.", human_input, portfolio),
-        mentioned_tickers=[],
-    )
+
+    if fallback:
+        fallback_symbol = fallback.upper().strip()
+        if _is_symbol(fallback_symbol):
+            return TickerSelection(
+                ticker=fallback_symbol,
+                reason="fallback",
+                rationale=_selection_rationale(fallback_symbol, "No dynamic universe available; using fallback ticker.", human_input, portfolio),
+                mentioned_tickers=[],
+            )
+
+    raise ValueError("select_ticker could not produce a ticker from human input, positions, news, universe, or fallback.")
 
 
-def _mentioned_tickers(human_input: list[str], watchlist: list[str]) -> list[str]:
-    allowed = set(watchlist)
-    mentioned: list[str] = []
-    for note in human_input:
-        text = clean_text(note, max_chars=2000)
-        upper = text.upper()
-        candidates = [symbol for symbol in _SYMBOL_RE.findall(upper) if symbol in allowed]
-        for alias, symbol in _ALIASES.items():
-            if alias in upper and symbol in allowed:
-                candidates.append(symbol)
-        for symbol in candidates:
-            if symbol not in mentioned:
-                mentioned.append(symbol)
-    return mentioned
+def _rank(candidates: list[str], ticker_provider: Any | None) -> str | None:
+    if ticker_provider is None or not candidates:
+        return None
+    pick_best = getattr(ticker_provider, "pick_best_by_metrics", None)
+    if not callable(pick_best):
+        return None
+    try:
+        picked = pick_best(candidates)
+    except Exception:
+        return None
+    if isinstance(picked, str) and picked.upper() in candidates:
+        return picked.upper()
+    return None
 
 
-def _positioned_watchlist_symbols(watchlist: list[str], portfolio: dict[str, Any] | None) -> list[str]:
+def _is_symbol(value: str) -> bool:
+    return 1 <= len(value) <= 5 and value.isalpha() and value.isupper()
+
+
+def _open_position_tickers(portfolio: dict[str, Any] | None) -> list[str]:
     open_positions = portfolio_positions(portfolio)
-    return [symbol for symbol in watchlist if open_positions.get(symbol, {}).get("qty", 0.0) > 0]
+    return [symbol for symbol, position in open_positions.items() if position.get("qty", 0.0) > 0]
 
 
 def _selection_rationale(
@@ -118,39 +116,9 @@ def _selection_rationale(
     portfolio: dict[str, Any] | None,
 ) -> str:
     position = position_for(portfolio, ticker)
-    position_text = "no current position"
     if position:
         position_text = f"current position qty={position.get('qty', 0)} market_value={position.get('market_value', 0)}"
+    else:
+        position_text = "no current position"
     input_text = "; ".join(human_input) if human_input else "no new human input"
     return f"{reason} Selected {ticker}; {position_text}; human_input={input_text}"
-
-def select_ticker_v2(
-    watchlist: str,
-    *,
-    human_input: list[str],
-    portfolio: dict[str, Any] | None,
-    cycle_index: int,
-    fallback: str | None = None,
-) -> TickerSelection:
-
-    ticker_provider: TickerProvider = TickerProvider()
-
-    tickers_list = ticker_provider.get_tickers_with_info(watchlist)
-
-    mentioned = _mentioned_tickers(human_input, [ t['name'] for t in tickers_list])
-    if mentioned:
-        ticker = mentioned[-1]
-        return TickerSelection(
-            ticker=ticker,
-            reason="human_input",
-            rationale=_selection_rationale(ticker, "Human input mentioned this ticker.", human_input, portfolio),
-            mentioned_tickers=mentioned,
-        )
-
-    ticker = tickers_list[0]
-    return TickerSelection(
-        ticker=ticker,
-        reason="most_valuable_by_metrics",
-        rationale=_selection_rationale(ticker, "Metrics used suggest this ticker as the most valuable.", human_input, portfolio),
-        mentioned_tickers=[],
-    )

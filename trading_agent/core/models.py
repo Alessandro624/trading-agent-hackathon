@@ -152,6 +152,7 @@ class RiskAssessment:
     stop_loss_triggered: bool = False
     take_profit_triggered: bool = False
     risk_flags: list[str] = field(default_factory=list)
+    human_risk_profile: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -171,6 +172,8 @@ class RiskAssessment:
             raise ValueError("risk take_profit_triggered must be a bool")
         if not isinstance(self.risk_flags, list):
             raise ValueError("risk_flags must be a list")
+        if not isinstance(self.human_risk_profile, dict):
+            raise ValueError("human_risk_profile must be a dict")
 
 
 @dataclass(slots=True)
@@ -263,6 +266,7 @@ class JournalEntry:
     decision: dict[str, Any]
     execution_result: dict[str, Any] | None
     draft_decision: dict[str, Any] | None = None
+    risk_assessment: dict[str, Any] = field(default_factory=dict)
     llm_provider: str = "none"
     llm_fallback_used: bool = False
     llm_fallback_provider: str | None = None
@@ -271,6 +275,11 @@ class JournalEntry:
     failures: list[str] = field(default_factory=list)
     human_input_used: list[str] = field(default_factory=list)
     entry_type: Literal["cycle"] = "cycle"
+    instruction_id: str | None = None
+    cancelled_by: str | None = None
+    retry_count: int = 0
+    failure_type: str | None = None
+    reversal_of: str | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -294,6 +303,8 @@ class JournalEntry:
             raise ValueError("decision must be a dict")
         if self.draft_decision is not None and not isinstance(self.draft_decision, dict):
             raise ValueError("draft_decision must be a dict or None")
+        if not isinstance(self.risk_assessment, dict):
+            raise ValueError("risk_assessment must be a dict")
         if self.execution_result is not None and not isinstance(self.execution_result, dict):
             raise ValueError("execution_result must be a dict or None")
         if not isinstance(self.guardrails_triggered, list):
@@ -304,6 +315,16 @@ class JournalEntry:
             raise ValueError("human_input_used must be a list")
         if not isinstance(self.llm_fallback_used, bool):
             raise ValueError("llm_fallback_used must be a bool")
+        if self.retry_count < 0:
+            raise ValueError("journal retry_count must be >= 0")
+        if self.instruction_id is not None and not isinstance(self.instruction_id, str):
+            raise ValueError("instruction_id must be a string or None")
+        if self.cancelled_by is not None and not isinstance(self.cancelled_by, str):
+            raise ValueError("cancelled_by must be a string or None")
+        if self.failure_type is not None and not isinstance(self.failure_type, str):
+            raise ValueError("failure_type must be a string or None")
+        if self.reversal_of is not None and not isinstance(self.reversal_of, str):
+            raise ValueError("reversal_of must be a string or None")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
