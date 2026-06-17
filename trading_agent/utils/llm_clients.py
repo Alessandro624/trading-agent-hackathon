@@ -93,7 +93,6 @@ class OpenRouterJsonClient(_ChatJsonClientMixin):
         max_tokens: int | None = None,
     ) -> None:
         self.model = model or os.getenv("OPENROUTER_MODEL", "poolside/laguna-xs.2:free")
-        self.base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OPENROUTER_TIMEOUT_SECONDS", 60)
         self.temperature = temperature if temperature is not None else _env_float("OPENROUTER_TEMPERATURE", 0)
         self.max_tokens = max_tokens if max_tokens is not None else _env_int("OPENROUTER_MAX_TOKENS", 1024)
@@ -107,8 +106,7 @@ class OpenRouterJsonClient(_ChatJsonClientMixin):
             except ImportError as error:
                 raise RuntimeError("Install LangChain dependencies with `uv sync` to use OpenRouter models.") from error
             self._model_cache = ChatOpenRouter(
-                model=self.model, 
-                base_url=self.base_url,
+                model=self.model,
                 temperature=self.temperature, 
                 timeout=self.timeout_seconds, 
                 max_tokens=self.max_tokens
@@ -223,3 +221,90 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_int(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)))
+
+
+
+
+# if __name__ == '__main__':
+    # from langchain_openrouter import ChatOpenRouter
+    # from langchain_openai import ChatOpenAI
+    # from typing import Optional
+    # from dotenv import load_dotenv
+    # load_dotenv()
+
+    # model = os.getenv("OPENROUTER_MODEL", "poolside/laguna-xs.2:free")
+    # api_key = os.getenv("OPENROUTER_API_KEY", None)
+    # base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+    # timeout_seconds = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", 60))
+    # temperature = float(os.get("OPENROUTER_TEMPERATURE", 0))
+    # max_tokens = int(os.get("OPENROUTER_MAX_TOKENS", 1024))
+    
+    # if not api_key:
+    #     raise RuntimeError("No API KEY")
+    
+
+    # print(api_key)
+    # print(model)
+    # print(timeout_seconds)
+    
+
+
+    # # class ChatOpenRouter(ChatOpenAI):
+
+    # #     @property
+    # #     def lc_secrets(self) -> dict[str, str]:
+    # #         return {"openai_api_key": "OPENROUTER_API_KEY"}
+
+    # #     def __init__(self,
+    # #                 openai_api_key: Optional[str] = None,
+    # #                 **kwargs):
+    # #         openai_api_key = (
+    # #             openai_api_key or os.environ.get("OPENROUTER_API_KEY")
+    # #         )
+    # #         super().__init__(
+    # #             base_url="https://openrouter.ai/api/v1",
+    # #             openai_api_key=openai_api_key,
+    # #             **kwargs
+    # #         )
+
+    # test_chat = ChatOpenRouter(
+    #     model=model, 
+    #     base_url=base_url,
+    #     openai_api_key=api_key,
+    #     temperature=temperature, 
+    #     timeout=timeout_seconds, 
+    #     max_tokens=max_tokens
+    # )
+
+    # messages = [
+    #     ("system", "Sei un assistente utile."),
+    #     ("human", "Qual è la capitale della Francia?")
+    # ]
+
+    # # Invia e ricevi
+    # response = test_chat.invoke(messages)
+
+    # # Estrai il testo
+    # print(response.content)
+
+
+
+    # import os
+    # from langchain_openrouter import ChatOpenRouter
+    # from dotenv import load_dotenv
+    # load_dotenv()
+    # # Inizializza il modello
+    # model = ChatOpenRouter(model="poolside/laguna-xs.2:free")
+
+    # # Definisci i messaggi
+    # messages = [
+    #     ("system", "Sei un assistente utile."),
+    #     ("human", "Qual è la capitale della Francia?")
+    # ]
+
+    # # Invia e ricevi
+    # response = model.invoke(messages)
+
+    # # Estrai il testo
+    # print(response.content)
+    # # Output: "La capitale della Francia è Parigi."   
