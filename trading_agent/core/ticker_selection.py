@@ -41,7 +41,7 @@ def parse_watchlist(value: str | list[str] | tuple[str, ...]) -> list[str]:
     return symbols
 
 
-def select_ticker_v0(
+def select_ticker(
     watchlist: list[str],
     *,
     human_input: list[str],
@@ -99,7 +99,7 @@ def _selection_rationale(
     input_text = "; ".join(human_input) if human_input else "no new human input"
     return f"{reason} Selected {ticker}; {position_text}; human_input={input_text}"
 
-def select_ticker(
+def select_ticker_v2(
     watchlist: str,
     *,
     human_input: list[str],
@@ -112,7 +112,7 @@ def select_ticker(
 
     tickers_list = ticker_provider.get_tickers_with_info(watchlist)
 
-    mentioned = _mentioned_tickers(human_input, [ t.name for t in tickers_list])
+    mentioned = _mentioned_tickers(human_input, [ t['name'] for t in tickers_list])
     if mentioned:
         ticker = mentioned[-1]
         return TickerSelection(
