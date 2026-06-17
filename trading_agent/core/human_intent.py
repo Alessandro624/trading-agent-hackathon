@@ -71,7 +71,7 @@ def split_compound_note(note: str) -> list[str]:
 
 def _extract_impact_topic(text: str) -> str | None:
     patterns = [
-        r"\b(?:related\s+or\s+impacted|related|impacted)\s+by\s+(?P<topic>.+)$",
+        r"\b(?:related\s+or\s+impacted|related\s+or\s+affected|related|impacted|affected)\s+by\s+(?P<topic>.+)$",
         r"\b(?:because\s+of|due\s+to)\s+(?P<topic>.+)$",
         r"\b(?:a causa di|per via di|colpiti da|impattati da)\s+(?P<topic>.+)$",
     ]

@@ -196,6 +196,15 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
     .human-chip.status {{ border-color: #d9dee7; background: #f7f8fa; color: #344054; }}
     .human-detail {{ color: #344054; margin-top: 3px; overflow-wrap: anywhere; }}
     .human-detail span {{ color: var(--muted); font-size: 12px; font-weight: 700; margin-right: 4px; }}
+    .human-target-list {{ display: grid; gap: 3px; margin-top: 3px; }}
+    .human-target-row {{
+      display: grid;
+      grid-template-columns: minmax(72px, auto) 1fr;
+      gap: 8px;
+      align-items: start;
+      color: #344054;
+    }}
+    .human-target-row b {{ color: #17202a; }}
     .table-wrap {{
       background: var(--panel);
       border: 1px solid var(--line);
@@ -814,10 +823,16 @@ def _human_event_detail_lines(details: Any) -> str:
         )
     planned = detail.get("planned_targets")
     if isinstance(planned, list) and planned:
-        lines.append(_human_detail("Planned positions", _format_human_target_list(planned)))
+        if _has_human_target_rationale(planned):
+            lines.append(_human_target_rationale_detail("Target rationale", planned))
+        else:
+            lines.append(_human_detail("Planned positions", _format_human_target_list(planned)))
     excluded = detail.get("excluded_tickers")
     if isinstance(excluded, list) and excluded:
-        lines.append(_human_detail("Excluded positions", _format_human_target_list(excluded)))
+        if _has_human_target_rationale(excluded):
+            lines.append(_human_target_rationale_detail("Excluded rationale", excluded))
+        else:
+            lines.append(_human_detail("Excluded positions", _format_human_target_list(excluded)))
     buyable = detail.get("buyable_universe")
     if buyable:
         lines.append(_human_detail("Buy universe", ", ".join(str(item) for item in buyable)))
@@ -829,6 +844,25 @@ def _human_event_detail_lines(details: Any) -> str:
 
 def _human_detail(label: str, value: str) -> str:
     return f'<div class="human-detail"><span>{_e(label)}:</span>{_e(value)}</div>'
+
+
+def _human_target_rationale_detail(label: str, items: list[Any]) -> str:
+    rows: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            rows.append(f'<div class="human-target-row"><b>{_e(str(item))}</b><div>-</div></div>')
+            continue
+        ticker = str(item.get("ticker") or item.get("symbol") or "-").upper()
+        sequence_index = item.get("sequence_index")
+        sequence_total = item.get("sequence_total")
+        sequence = f" {sequence_index}/{sequence_total}" if sequence_index and sequence_total else ""
+        rationale = str(item.get("rationale") or "").strip() or "-"
+        rows.append(f'<div class="human-target-row"><b>{_e(ticker + sequence)}</b><div>{_e(rationale)}</div></div>')
+    return f'<div class="human-detail"><span>{_e(label)}:</span><div class="human-target-list">{"".join(rows)}</div></div>'
+
+
+def _has_human_target_rationale(items: list[Any]) -> bool:
+    return any(isinstance(item, dict) and str(item.get("rationale") or "").strip() for item in items)
 
 
 def _format_human_target_list(items: list[Any]) -> str:

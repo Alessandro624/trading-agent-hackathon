@@ -19,8 +19,8 @@ class RiskPolicy:
     max_notional_per_order: float = 1000.0
     cash_risk_fraction: float = 0.10
     portfolio_risk_fraction: float = 0.02
-    stop_loss_fraction: float = 0.08
-    take_profit_fraction: float = 0.12
+    stop_loss_fraction: float = 0.03
+    take_profit_fraction: float = 0.02
 
     def adjusted_for_human_profile(self, profile: HumanRiskProfile | dict[str, Any] | None) -> "RiskPolicy":
         risk_profile = _coerce_human_risk_profile(profile)
@@ -47,8 +47,8 @@ class RiskPolicy:
             max_notional_per_order=float(os.getenv("TRADING_MAX_NOTIONAL_PER_ORDER", "1000")),
             cash_risk_fraction=float(os.getenv("TRADING_CASH_RISK_FRACTION", "0.10")),
             portfolio_risk_fraction=float(os.getenv("TRADING_PORTFOLIO_RISK_FRACTION", "0.02")),
-            stop_loss_fraction=float(os.getenv("TRADING_STOP_LOSS_FRACTION", "0.08")),
-            take_profit_fraction=float(os.getenv("TRADING_TAKE_PROFIT_FRACTION", "0.12")),
+            stop_loss_fraction=float(os.getenv("TRADING_STOP_LOSS_FRACTION", "0.03")),
+            take_profit_fraction=float(os.getenv("TRADING_TAKE_PROFIT_FRACTION", "0.02")),
         )
 
     def max_quantity(
