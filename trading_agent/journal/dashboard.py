@@ -776,8 +776,12 @@ def _human_status_summary(statuses: list[str]) -> str:
 
 
 def _human_status_steps(statuses: list[str]) -> str:
-    cleaned = [status for status in statuses if status]
-    return "".join(f'<span class="human-step-chip">{_e(status)}</span>' for status in cleaned)
+    cleaned = [s for s in statuses if s]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return f'<span class="human-step-chip">{_e(cleaned[0])}</span>'
+    return f'<span class="human-step-chip">{_e(cleaned[0])}</span>' f'<span class="human-step-chip">···</span>' f'<span class="human-step-chip">{_e(cleaned[-1])}</span>'
 
 
 def _human_event_meta(row: dict[str, Any], details: Any) -> str:
@@ -851,17 +855,23 @@ def _human_detail(label: str, value: str) -> str:
 
 def _human_target_rationale_detail(label: str, items: list[Any]) -> str:
     rows: list[str] = []
+    rationales = [str(item.get("rationale") or "").strip() for item in items if isinstance(item, dict)]
+    all_same = len(set(rationales)) == 1 and rationales[0]
+
     for item in items:
         if not isinstance(item, dict):
             rows.append(f'<div class="human-target-row"><b>{_e(str(item))}</b><div>-</div></div>')
             continue
-        ticker = str(item.get("ticker") or item.get("symbol") or "-").upper()
-        sequence_index = item.get("sequence_index")
-        sequence_total = item.get("sequence_total")
-        sequence = f" {sequence_index}/{sequence_total}" if sequence_index and sequence_total else ""
+        ticker = str(item.get("ticker") or "-").upper()
+        seq_i = item.get("sequence_index")
+        seq_t = item.get("sequence_total")
+        seq = f" {seq_i}/{seq_t}" if seq_i and seq_t else ""
         rationale = str(item.get("rationale") or "").strip() or "-"
-        rows.append(f'<div class="human-target-row"><b>{_e(ticker + sequence)}</b><div>{_e(rationale)}</div></div>')
-    return f'<div class="human-detail"><span>{_e(label)}:</span><div class="human-target-list">{"".join(rows)}</div></div>'
+        display = "-" if all_same else rationale
+        rows.append(f'<div class="human-target-row"><b>{_e(ticker + seq)}</b><div>{_e(display)}</div></div>')
+
+    common = f'<div class="human-detail"><span>Common rationale:</span>{_e(rationales[0])}</div>' if all_same else ""
+    return f'<div class="human-detail"><span>{_e(label)}:</span>' f'<div class="human-target-list">{"".join(rows)}</div></div>' + common
 
 
 def _has_human_target_rationale(items: list[Any]) -> bool:
