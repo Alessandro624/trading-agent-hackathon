@@ -16,9 +16,11 @@ class RunContext:
     resumed_from: Path | None = None
 
 
-def create_run_context(base_dir: Path, ticker: str, resume_from: Path | None = None) -> RunContext:
+def create_run_context(base_dir: Path, ticker: str | None = None, resume_from: Path | None = None) -> RunContext:
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    run_dir = _unique_run_dir(base_dir / f"run_{timestamp}_{ticker.upper()}")
+    tag = _folder_tag(ticker)
+    folder_name = f"run_{timestamp}{f'_{tag}' if tag else ''}"
+    run_dir = _unique_run_dir(base_dir / folder_name)
     run_dir.mkdir(parents=True, exist_ok=True)
     context = RunContext(
         run_dir,
@@ -34,6 +36,15 @@ def create_run_context(base_dir: Path, ticker: str, resume_from: Path | None = N
         _copy_resume_sidecar(context.resumed_from.parent, context.run_dir, "human_input.cursor")
     _ensure_human_input_sidecars(context)
     return context
+
+
+def _folder_tag(ticker: str | None) -> str:
+    if not ticker:
+        return ""
+    cleaned = ticker.strip().upper()
+    if not cleaned or cleaned == "MULTI":
+        return ""
+    return cleaned
 
 
 def latest_run(base_dir: Path) -> RunContext:
