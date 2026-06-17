@@ -826,14 +826,14 @@ OUTPUT: Return ONLY valid JSON. No prose, no markdown fences.
 
 BRAND RESOLUTION (always apply before output):
 Resolve product/brand/subsidiary names to canonical tickers:
-  Facebook/WhatsApp/Instagram/Threads → META
-  Google/YouTube/Android/Chrome/Gmail → GOOGL
-  Amazon/AWS/Alexa/Prime/Kindle       → AMZN
-  Microsoft/Windows/Azure/LinkedIn/GitHub → MSFT
-  Apple/iPhone/iPad/Mac/iOS/iCloud    → AAPL
-  Tesla/Model 3/Model Y               → TSLA
-  Nvidia/GeForce/CUDA                 → NVDA
-  OpenAI/ChatGPT                      → MSFT (OpenAI is private)
+  Facebook/WhatsApp/Instagram/Threads       -> META
+  Google/YouTube/Android/Chrome/Gmail       -> GOOGL
+  Amazon/AWS/Alexa/Prime/Kindle             -> AMZN
+  Microsoft/Windows/Azure/LinkedIn/GitHub   -> MSFT
+  Apple/iPhone/iPad/Mac/iOS/iCloud          -> AAPL
+  Tesla/Model 3/Model Y                     -> TSLA
+  Nvidia/GeForce/CUDA                       -> NVDA
+  OpenAI/ChatGPT                            -> MSFT (OpenAI is private)
   Netflix → NFLX | Disney → DIS
 If two brands resolve to the same ticker, emit only one entry.
 
