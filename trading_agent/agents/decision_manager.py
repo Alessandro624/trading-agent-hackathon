@@ -5,6 +5,7 @@ from dataclasses import asdict
 
 from trading_agent.core import (
     AnalystDecisionOutput,
+    HumanIntent,
     LlmClient,
     MarketSnapshot,
     NewsOpinion,
@@ -63,6 +64,7 @@ def decide_from_opinions(
     retry_policy = retry_policy or RetryPolicy(max_attempts=2)
     parsed_human_intent = parse_human_intent(human_input or [])
     human_intent_payload = human_intent or parsed_human_intent.to_dict()
+    effective_human_intent = _human_intent_from_payload(human_intent) if human_intent else parsed_human_intent
     payload = json.dumps(
         {
             "snapshot": {
@@ -115,7 +117,7 @@ def decide_from_opinions(
             rationale_details=safe_rationale_details(snapshot, "Decision Manager validation failed.", errors),
         )
 
-    deterministic_human_trade = _deterministic_human_trade_decision(snapshot, parsed, risk, parsed_human_intent)
+    deterministic_human_trade = _deterministic_human_trade_decision(snapshot, parsed, risk, effective_human_intent)
     if deterministic_human_trade is not None:
         return deterministic_human_trade
 
@@ -172,6 +174,18 @@ def _action_limit(action: str, risk: RiskAssessment) -> int:
     if action == "SELL":
         return risk.max_sell_quantity
     return 0
+
+
+def _human_intent_from_payload(payload: dict | None) -> HumanIntent:
+    payload = payload or {}
+    return HumanIntent(
+        intents=[str(item) for item in payload.get("intents", []) if isinstance(item, str)],
+        tickers=[str(item).upper() for item in payload.get("tickers", []) if isinstance(item, str)],
+        requested_action=payload.get("requested_action"),
+        risk_preference=payload.get("risk_preference"),
+        impact_topic=payload.get("impact_topic"),
+        summary=str(payload.get("summary") or "Resolved human intent."),
+    )
 
 
 def _deterministic_human_trade_decision(
