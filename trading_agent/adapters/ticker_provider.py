@@ -2,11 +2,10 @@ from __future__ import annotations
 
 import re
 
-from dataclasses import dataclass, field
-from typing import Optional, Any
+from typing import Optional
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetAssetsRequest
-from alpaca.trading.enums import AssetClass, AssetExchange, AssetStatus
+from alpaca.trading.enums import AssetClass, AssetStatus
 
 from trading_agent.utils.config import require_env
 from trading_agent.core.data_hygiene import clean_text
@@ -90,15 +89,3 @@ class TickerProvider:
             if isinstance(name, str) and name:
                 return name.upper()
         return unique[0]
-
-
-if __name__ == "__main__":
-    from dotenv import load_dotenv
-
-    load_dotenv()
-
-    t = TickerProvider()
-
-    tickers = t.get_tickers_with_info("AAPL,NVDA")
-
-    print(tickers[:5])
