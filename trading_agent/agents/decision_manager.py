@@ -69,7 +69,6 @@ Flag if current decision repeats a recent pattern without new justification.
 """
 
 
-
 def decide_from_opinions(
     snapshot: MarketSnapshot,
     recent_entries: list,
@@ -245,7 +244,7 @@ def _deterministic_human_trade_decision(
         reasons.append("Human input requested SELL")
         guardrails.append("guardrail:human_sell_intent")
 
-    if action is None and "position_sweep" in human_intent.intents and risk.max_sell_quantity > 0:
+    if action is None and "position_sweep" in human_intent.intents and not human_intent.impact_topic and risk.max_sell_quantity > 0:
         action = "SELL"
         quantity = risk.max_sell_quantity
         reasons.append(_human_position_sweep_reason(snapshot.ticker, human_intent))
