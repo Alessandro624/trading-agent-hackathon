@@ -1449,7 +1449,7 @@ def _sector_bar_html(breakdown: dict[str, float]) -> str:
         "consumer": "#92400e",
         "other": "#667085",
     }
-    bars = "".join(f'<div style="height:100%;width:{pct}%;background:{COLORS.get(sector,"#667085")};' f"title='{sector} {pct}%'\"></div>" for sector, pct in breakdown.items())
+    bars = "".join(f'<div style="height:100%;width:{pct}%;background:{COLORS.get(sector,"#667085")}" ' f'title="{sector} {pct}%"></div>' for sector, pct in breakdown.items())
     labels = " ".join(f'<span style="font-size:11px;color:{COLORS.get(s,"#667085")}">' f"{s[:4]} {p}%</span>" for s, p in breakdown.items())
     return (
         f'<div style="display:flex;height:6px;border-radius:999px;overflow:hidden;'
