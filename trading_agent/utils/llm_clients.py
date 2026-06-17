@@ -32,11 +32,13 @@ class _ChatJsonClientMixin:
 class OpenAiJsonClient(_ChatJsonClientMixin):
     def __init__(
         self,
+        api_key: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> None:
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.model = model or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OPENAI_TIMEOUT_SECONDS", 60)
         self.temperature = temperature if temperature is not None else _env_float("OPENAI_TEMPERATURE", 0)
@@ -50,7 +52,7 @@ class OpenAiJsonClient(_ChatJsonClientMixin):
                 from langchain_openai import ChatOpenAI
             except ImportError as error:
                 raise RuntimeError("Install LangChain dependencies with `uv sync` to use OpenAI models.") from error
-            self._model_cache = ChatOpenAI(model=self.model, temperature=self.temperature, timeout=self.timeout_seconds, max_tokens=self.max_tokens)
+            self._model_cache = ChatOpenAI(api_key=self.api_key, model=self.model, temperature=self.temperature, timeout=self.timeout_seconds, max_tokens=self.max_tokens)
         return self._model_cache
 
 
@@ -85,18 +87,21 @@ class OllamaJsonClient(_ChatJsonClientMixin):
                 num_predict=self.max_tokens,
             )
         return self._model_cache
-    
+
 
 class OpenRouterJsonClient(_ChatJsonClientMixin):
     def __init__(
         self,
+        api_key: str | None = None,
         model: str | None = None,
         timeout_seconds: float | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> None:
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         self.model = model or os.getenv("OPENROUTER_MODEL", "poolside/laguna-xs.2:free")
-        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_int("OPENROUTER_TIMEOUT_SECONDS", 60)
+        self.base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OPENROUTER_TIMEOUT_SECONDS", 60)
         self.temperature = temperature if temperature is not None else _env_float("OPENROUTER_TEMPERATURE", 0)
         self.max_tokens = max_tokens if max_tokens is not None else _env_int("OPENROUTER_MAX_TOKENS", 1024)
         self.provider_name = "openrouter"
@@ -105,14 +110,16 @@ class OpenRouterJsonClient(_ChatJsonClientMixin):
     def _model(self):
         if self._model_cache is None:
             try:
-                from langchain_openrouter import ChatOpenRouter
+                from langchain_openai import ChatOpenAI
             except ImportError as error:
-                raise RuntimeError("Install LangChain dependencies with `uv sync` to use OpenRouter models.") from error
-            self._model_cache = ChatOpenRouter(
+                raise RuntimeError("Install LangChain OpenAI dependencies with `uv sync` to use OpenRouter models.") from error
+            self._model_cache = ChatOpenAI(
+                api_key=self.api_key,
                 model=self.model,
-                temperature=self.temperature, 
-                timeout=self.timeout_seconds * 1000,  ## It expects ms instead of s
-                max_tokens=self.max_tokens
+                base_url=self.base_url,
+                temperature=self.temperature,
+                timeout=self.timeout_seconds,
+                max_tokens=self.max_tokens,
             )
         return self._model_cache
 
