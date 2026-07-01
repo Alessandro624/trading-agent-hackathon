@@ -12,7 +12,6 @@ def compact_recent_entries(
     per_ticker_limit: int | None = None,
     global_limit: int = 1,
 ) -> list[dict[str, Any]]:
-    """Keep recent decisions small enough to inject into Analyst prompts."""
     scoped_entries = _scoped_entries(entries, limit, ticker, per_ticker_limit, global_limit)
     compact: list[dict[str, Any]] = []
     for entry, scope in scoped_entries:

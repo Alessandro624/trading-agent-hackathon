@@ -19,6 +19,7 @@ from trading_agent.core import (
 )
 from trading_agent.journal import compact_recent_entries
 from trading_agent.utils import get_logger, llm_metadata
+from trading_agent.utils.llm_clients import should_retry_llm_error
 
 logger = get_logger("decision_manager")
 
@@ -94,7 +95,7 @@ def decide_from_opinions(
             rationale_details=_multi_agent_details(technical, news, risk, "Risk Manager blocked trading."),
         )
 
-    retry_policy = retry_policy or RetryPolicy(max_attempts=2)
+    retry_policy = retry_policy or RetryPolicy(max_attempts=2, should_retry=should_retry_llm_error)
     parsed_human_intent = parse_human_intent(human_input or [])
     human_intent_payload = human_intent or parsed_human_intent.to_dict()
     effective_human_intent = _human_intent_from_payload(human_intent) if human_intent else parsed_human_intent
@@ -150,7 +151,7 @@ def decide_from_opinions(
             rationale_details=safe_rationale_details(snapshot, "Decision Manager validation failed.", errors),
         )
 
-    deterministic_human_trade = _deterministic_human_trade_decision(snapshot, parsed, risk, effective_human_intent)
+    deterministic_human_trade = _deterministic_human_trade_decision(snapshot, parsed, risk, effective_human_intent, human_intent_payload=human_intent_payload)
     if deterministic_human_trade is not None:
         return deterministic_human_trade
 
@@ -168,8 +169,9 @@ def decide_from_opinions(
             rationale_details=_multi_agent_details(technical, news, risk, "Requested quantity exceeded deterministic action-specific risk limit."),
         )
 
-    details = _multi_agent_details(technical, news, risk, parsed.rationale_details.get("summary", parsed.rationale))
-    details.update(parsed.rationale_details or {})
+    parsed_details = parsed.rationale_details_dict()
+    details = _multi_agent_details(technical, news, risk, parsed_details.get("summary") or parsed.rationale)
+    details.update(parsed_details)
     return TradingDecision(
         ticker=snapshot.ticker,
         action=parsed.action,
@@ -226,23 +228,73 @@ def _deterministic_human_trade_decision(
     parsed: AnalystDecisionOutput,
     risk: RiskAssessment,
     human_intent,
+    human_intent_payload: dict | None = None,
 ) -> TradingDecision | None:
     action: str | None = None
     quantity = 0
     reasons: list[str] = []
     guardrails: list[str] = []
 
+    payload = human_intent_payload or {}
+    requested_notional_usd = payload.get("requested_notional_usd")
+    requested_quantity = payload.get("requested_quantity")
+    partial_fraction = payload.get("partial_fraction")
+    try:
+        requested_notional_usd = float(requested_notional_usd) if requested_notional_usd is not None else None
+    except (TypeError, ValueError):
+        requested_notional_usd = None
+    try:
+        requested_quantity = int(requested_quantity) if requested_quantity is not None else None
+    except (TypeError, ValueError):
+        requested_quantity = None
+    try:
+        partial_fraction = float(partial_fraction) if partial_fraction is not None else None
+        if partial_fraction is not None and (partial_fraction <= 0 or partial_fraction > 1):
+            partial_fraction = None
+    except (TypeError, ValueError):
+        partial_fraction = None
+
     if human_intent.requested_action == "BUY" and _human_intent_applies_to_ticker(human_intent, snapshot.ticker):
         action = "BUY"
-        quantity = min(1, risk.max_buy_quantity)
-        reasons.append("Human input requested BUY")
-        guardrails.append("guardrail:human_buy_intent")
+        if requested_notional_usd and requested_notional_usd > 0 and snapshot.price and snapshot.price > 0:
+            from math import floor as _floor
+
+            qty_from_notional = max(0, _floor(requested_notional_usd / snapshot.price))
+            explicit_limit = risk.max_explicit_notional_buy_quantity
+            quantity = min(qty_from_notional, explicit_limit)
+            if qty_from_notional > explicit_limit:
+                reasons.append(
+                    f"Human input requested BUY with notional ${requested_notional_usd:.2f} "
+                    f"at price ${snapshot.price:.2f} -> {qty_from_notional} shares, "
+                    f"reduced to {quantity} to respect cash/portfolio exposure limits "
+                    f"(max_explicit_notional_buy_quantity={explicit_limit})"
+                )
+            else:
+                reasons.append(f"Human input requested BUY with notional ${requested_notional_usd:.2f} " f"at price ${snapshot.price:.2f} -> {quantity} shares")
+            guardrails.append("guardrail:human_buy_intent_notional")
+        elif requested_quantity and requested_quantity > 0:
+            quantity = min(requested_quantity, risk.max_buy_quantity)
+            reasons.append(f"Human input requested BUY quantity {requested_quantity} -> {quantity} shares")
+            guardrails.append("guardrail:human_buy_intent_quantity")
+        else:
+            quantity = min(1, risk.max_buy_quantity)
+            reasons.append("Human input requested BUY")
+            guardrails.append("guardrail:human_buy_intent")
 
     if human_intent.requested_action == "SELL" and _human_intent_applies_to_ticker(human_intent, snapshot.ticker):
         action = "SELL"
-        quantity = risk.max_sell_quantity
-        reasons.append("Human input requested SELL")
-        guardrails.append("guardrail:human_sell_intent")
+        if partial_fraction and partial_fraction > 0:
+            held_qty = float(risk.current_quantity or 0)
+            from math import floor as _floor
+
+            qty_from_fraction = max(1, _floor(held_qty * partial_fraction)) if held_qty > 0 else 0
+            quantity = min(qty_from_fraction, risk.max_sell_quantity)
+            reasons.append(f"Human input requested partial SELL ({partial_fraction*100:.0f}% of {held_qty} shares) " f"-> {qty_from_fraction} shares (capped at {risk.max_sell_quantity})")
+            guardrails.append("guardrail:human_sell_intent_partial")
+        else:
+            quantity = risk.max_sell_quantity
+            reasons.append("Human input requested SELL")
+            guardrails.append("guardrail:human_sell_intent")
 
     if action is None and "position_sweep" in human_intent.intents and not human_intent.impact_topic and risk.max_sell_quantity > 0:
         action = "SELL"
@@ -274,11 +326,13 @@ def _deterministic_human_trade_decision(
         used_data_sources=[*(parsed.used_data_sources or snapshot.data_sources), "risk_assessment", "human_intent"],
         guardrails_triggered=guardrails,
         rationale_details={
-            **(parsed.rationale_details or {}),
+            **parsed.rationale_details_dict(),
             "summary": "; ".join(reasons),
             "human_intent": human_intent.to_dict(),
             "human_impact_topic": human_intent.impact_topic,
             "human_selected_ticker": snapshot.ticker,
+            "human_requested_notional_usd": requested_notional_usd,
+            "human_partial_fraction": partial_fraction,
             "risk_flags": risk.risk_flags,
         },
     )

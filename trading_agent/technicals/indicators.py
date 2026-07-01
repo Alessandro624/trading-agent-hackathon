@@ -4,7 +4,6 @@ from trading_agent.core import TechnicalIndicators
 
 
 def _ema(values: list[float], period: int) -> list[float]:
-    """Calculate an exponential moving average used by MACD."""
     if not values:
         return []
     alpha = 2 / (period + 1)
@@ -15,7 +14,6 @@ def _ema(values: list[float], period: int) -> list[float]:
 
 
 def _rsi(values: list[float], period: int = 14) -> float | None:
-    """Estimate momentum by comparing recent average gains and losses."""
     if len(values) <= period:
         return None
     gains: list[float] = []
@@ -33,7 +31,6 @@ def _rsi(values: list[float], period: int = 14) -> float | None:
 
 
 def calculate_indicators(closes: list[float]) -> TechnicalIndicators:
-    """Return SMA, RSI and MACD signals from validated close prices."""
     clean = [float(value) for value in closes if value > 0]
     notes: list[str] = []
     if len(clean) < 26:

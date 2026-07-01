@@ -2,31 +2,425 @@ from __future__ import annotations
 
 import html
 import json
-from collections import Counter
-from datetime import datetime
+import logging
+import os
+import tempfile
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from trading_agent.core.portfolio import float_or_none, normalize_positions
+logger = logging.getLogger("trading_agent.dashboard")
+
+
+class DashboardProjectionWatcher:
+    _SIDECARS = (
+        "constraints.json",
+        "scheduled_actions.json",
+        "conditional_orders.json",
+        "pending_confirmations.json",
+        "instruction_ledger.json",
+        "agent_replies.md",
+    )
+
+    def __init__(
+        self,
+        journal_path: Path,
+        projection_path: Path,
+        *,
+        poll_seconds: float = 0.5,
+    ) -> None:
+        self.journal_path = Path(journal_path)
+        self.projection_path = Path(projection_path)
+        self.poll_seconds = poll_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_snapshot: tuple[tuple[str, int, int] | None, ...] | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        write_dashboard_projection(self.journal_path, self.projection_path)
+        self._last_snapshot = self._snapshot()
+        self._thread = threading.Thread(
+            target=self._watch,
+            name="dashboard-projection-watcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.poll_seconds * 3))
+        self._thread = None
+
+    def _watched_paths(self) -> tuple[Path, ...]:
+        run_dir = self.journal_path.parent
+        return (self.journal_path, *(run_dir / name for name in self._SIDECARS))
+
+    def _snapshot(self) -> tuple[tuple[str, int, int] | None, ...]:
+        snapshot: list[tuple[str, int, int] | None] = []
+        for path in self._watched_paths():
+            try:
+                stat = path.stat()
+                snapshot.append((path.name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                snapshot.append(None)
+        return tuple(snapshot)
+
+    def _watch(self) -> None:
+        while not self._stop_event.wait(self.poll_seconds):
+            snapshot = self._snapshot()
+            if snapshot == self._last_snapshot:
+                continue
+            try:
+                write_dashboard_projection(self.journal_path, self.projection_path)
+                self._last_snapshot = snapshot
+            except Exception:
+                logger.exception("dashboard.projection.refresh_failed")
 
 
 def render_dashboard(journal_path: Path, output_path: Path) -> Path:
-    rows = _read_rows(journal_path)
-    display_rows = _cycle_rows(rows)
-    stats = _stats(rows)
-    details_json = json.dumps([_details_payload(row) for row in display_rows], ensure_ascii=False)
-    table_rows = "\n".join(_render_row(index, row) for index, row in enumerate(display_rows))
-    human_events_html = _render_human_events(rows)
+    shell_path = output_path
+    projection_path = output_path.parent / "dashboard_data.js"
+    shell_path.write_text(_SHELL_HTML, encoding="utf-8")
+    write_dashboard_projection(journal_path, projection_path)
+    return shell_path
 
-    document = f"""<!doctype html>
+
+def write_dashboard_projection(journal_path: Path, projection_path: Path) -> Path:
+    run_dir = journal_path.parent
+    data = _build_projection_data(journal_path, run_dir)
+    payload = "window.DASHBOARD_DATA = " + json.dumps(data, ensure_ascii=False, default=str) + ";\n"
+    projection_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".dashboard_data.", suffix=".js", dir=str(projection_path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp_path, projection_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return projection_path
+
+
+def _build_projection_data(journal_path: Path, run_dir: Path) -> dict[str, Any]:
+    rows = _read_rows(journal_path)
+    cycle_rows = [r for r in rows if r.get("entry_type", "cycle") == "cycle"]
+    stage_rows = [r for r in rows if r.get("entry_type") == "stage"]
+    human_event_rows = [r for r in rows if r.get("entry_type") == "human_event"]
+    ledger = _load_json_sidecar(run_dir / "instruction_ledger.json", "entries")
+    confirmations = _confirmation_workflows(
+        _load_json_sidecar(run_dir / "pending_confirmations.json", "confirmations"),
+        ledger,
+    )
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "run_dir": run_dir.name,
+        "stats": _stats(cycle_rows, stage_rows, human_event_rows, rows),
+        "cycles": [_cycle_summary(row) for row in cycle_rows],
+        "human_events": _grouped_human_events(human_event_rows),
+        "stages": [_stage_summary(row) for row in stage_rows[-200:]],
+        "constraints": _load_json_sidecar(run_dir / "constraints.json", "constraints"),
+        "scheduled_actions": _load_json_sidecar(run_dir / "scheduled_actions.json", "actions"),
+        "conditional_orders": _load_json_sidecar(run_dir / "conditional_orders.json", "orders"),
+        "pending_confirmations": confirmations,
+        "instruction_ledger": ledger,
+        "agent_replies": _load_agent_replies(run_dir / "agent_replies.md"),
+        "diversification_series": _diversification_series(cycle_rows),
+        "evidence": _collect_evidence(cycle_rows, stage_rows, human_event_rows),
+    }
+
+
+def _confirmation_workflows(
+    confirmations: list[dict[str, Any]],
+    ledger: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    for confirmation in confirmations:
+        confirmation_id = str(confirmation.get("confirmation_id") or "")
+        children = [entry for entry in ledger if str(entry.get("originating_confirmation_id") or "") == confirmation_id]
+        if not children:
+            continue
+        statuses = [str(entry.get("status") or "queued").lower() for entry in children]
+        completed = statuses.count("completed")
+        cancelled = statuses.count("cancelled") + statuses.count("abandoned")
+        active = statuses.count("active")
+        queued = statuses.count("queued")
+        if completed == len(children):
+            workflow_status = "completed"
+        elif cancelled == len(children):
+            workflow_status = "cancelled"
+        elif completed and cancelled and completed + cancelled == len(children):
+            workflow_status = "partially_cancelled"
+        elif completed:
+            workflow_status = "partially_completed"
+        elif active:
+            workflow_status = "active"
+        else:
+            workflow_status = "queued"
+        confirmation["workflow_id"] = next(
+            (entry.get("workflow_id") for entry in children if entry.get("workflow_id")),
+            f"workflow-{confirmation_id}",
+        )
+        confirmation["workflow_status"] = workflow_status
+        confirmation["operations_progress"] = {
+            "completed": completed,
+            "cancelled": cancelled,
+            "total": len(children),
+        }
+        confirmation["child_instructions"] = children
+        confirmation["queued_operations"] = queued
+    return confirmations
+
+
+def _read_rows(journal_path: Path) -> list[dict[str, Any]]:
+    if not journal_path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in journal_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _load_json_sidecar(path: Path, key: str) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as error:
+        logger.warning("dashboard.sidecar.malformed path=%s reason=%s", path, error)
+        return []
+    items = data.get(key) if isinstance(data, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def _load_agent_replies(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        from trading_agent.core.agent_reply import read_agent_replies
+
+        return read_agent_replies(path)
+    except Exception as error:
+        logger.warning("dashboard.agent_replies.malformed path=%s reason=%s", path, error)
+        return []
+
+
+def _stats(cycle_rows, stage_rows, human_event_rows, all_rows) -> dict[str, Any]:
+    from collections import Counter
+
+    actions = Counter(row.get("action", "UNKNOWN") for row in cycle_rows)
+    tickers = sorted({row.get("ticker", "-") for row in all_rows})
+    timestamps = [row.get("timestamp") for row in (cycle_rows or all_rows) if row.get("timestamp")]
+    guardrails = sum(len(row.get("guardrails_triggered") or []) for row in cycle_rows)
+    failures = sum(len(row.get("failures") or []) for row in all_rows)
+    failures += sum(1 for row in stage_rows if row.get("status") == "failed")
+    retries = sum(_retry_count(row) for row in cycle_rows)
+    fallbacks = sum(1 for row in cycle_rows if row.get("llm_fallback_used"))
+    return {
+        "actions": dict(actions),
+        "cycle_count": len(cycle_rows),
+        "stage_count": len(stage_rows),
+        "human_event_count": len(human_event_rows),
+        "tickers": ", ".join(tickers) if tickers else "-",
+        "guardrails": guardrails,
+        "failures": failures,
+        "retries": retries,
+        "fallbacks": fallbacks,
+        "first_timestamp": min(timestamps) if timestamps else None,
+        "last_timestamp": max(timestamps) if timestamps else None,
+    }
+
+
+def _retry_count(row: dict[str, Any]) -> int:
+    try:
+        return int(row.get("retry_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cycle_summary(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "entity_id": f"cycle:{row.get('timestamp')}:{row.get('ticker')}",
+        "timestamp": row.get("timestamp"),
+        "ticker": row.get("ticker"),
+        "action": row.get("action"),
+        "outcome": row.get("outcome"),
+        "confidence": row.get("confidence"),
+        "cycle_summary": row.get("cycle_summary"),
+        "rationale": (row.get("rationale") or "")[:500],
+        "instruction_id": row.get("instruction_id"),
+        "cancelled_by": row.get("cancelled_by"),
+        "reversal_of": row.get("reversal_of"),
+        "retry_count": row.get("retry_count"),
+        "failure_type": row.get("failure_type"),
+        "quantity": (row.get("decision") or {}).get("quantity"),
+        "guardrails_triggered": row.get("guardrails_triggered") or [],
+        "failures": row.get("failures") or [],
+        "portfolio_after": _portfolio_after(row),
+        "details": row,
+    }
+
+
+def _stage_summary(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "timestamp": row.get("timestamp"),
+        "ticker": row.get("ticker"),
+        "stage": row.get("stage"),
+        "status": row.get("status"),
+        "message": (row.get("message") or "")[:500],
+        "details": row.get("details") or {},
+    }
+
+
+def _grouped_human_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in events:
+        key = str(row.get("note_id") or row.get("instruction_id") or row.get("timestamp") or len(order))
+        if key not in groups:
+            groups[key] = {
+                "entity_id": f"human:{key}",
+                "note_id": key,
+                "original_note": "",
+                "events": [],
+                "tickers": [],
+                "instruction_ids": [],
+                "details": {},
+                "statuses": [],
+            }
+            order.append(key)
+        group = groups[key]
+        if not group["original_note"] and str(row.get("status") or "").lower() == "received":
+            group["original_note"] = str(row.get("note") or "")
+        group["events"].append(
+            {
+                "timestamp": row.get("timestamp"),
+                "status": row.get("status"),
+                "instruction_id": row.get("instruction_id"),
+                "ticker": row.get("ticker"),
+                "note": (row.get("note") or "")[:500],
+                "details": row.get("details") or {},
+            }
+        )
+        ticker = str(row.get("ticker") or "")
+        if ticker and ticker != "HUMAN" and ticker not in group["tickers"]:
+            group["tickers"].append(ticker)
+        instruction_id = str(row.get("instruction_id") or "")
+        if instruction_id and instruction_id not in group["instruction_ids"]:
+            group["instruction_ids"].append(instruction_id)
+        details = row.get("details")
+        if isinstance(details, dict):
+            group["details"].update({k: v for k, v in details.items() if v is not None})
+        group["statuses"].append(str(row.get("status") or ""))
+        if not group["original_note"]:
+            group["original_note"] = str(group["events"][0].get("note") or "")
+    return [groups[k] for k in order]
+
+
+def _portfolio_after(row: dict[str, Any]) -> dict[str, Any]:
+    execution = row.get("execution_result") or {}
+    portfolio = execution.get("portfolio_after") or {}
+    if portfolio:
+        return portfolio
+    return row.get("market_snapshot", {}).get("portfolio_after") or {}
+
+
+def _diversification_series(cycle_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    try:
+        from trading_agent.core.sector_classifier import SectorClassifier
+        from trading_agent.core.portfolio import normalize_positions
+
+        classifier = SectorClassifier()
+    except ImportError:
+        return []
+    series: list[dict[str, Any]] = []
+    for row in cycle_rows:
+        portfolio = _portfolio_after(row) or {}
+        positions = portfolio.get("positions")
+        normalized = normalize_positions(positions) if positions else {}
+        if not normalized:
+            continue
+        totals: dict[str, float] = {}
+        total_value = 0.0
+        for symbol, data in normalized.items():
+            sector = classifier.classify(symbol, llm_client=None)
+            try:
+                mv = float(data.get("market_value") or 0.0)
+            except (TypeError, ValueError):
+                mv = 0.0
+            totals[sector] = totals.get(sector, 0.0) + mv
+            total_value += mv
+        if total_value <= 0:
+            continue
+        breakdown = {s: round(v / total_value * 100, 1) for s, v in sorted(totals.items())}
+        series.append(
+            {
+                "timestamp": row.get("timestamp"),
+                "ticker": row.get("ticker"),
+                "action": row.get("action"),
+                "breakdown": breakdown,
+            }
+        )
+    return series
+
+
+def _collect_evidence(cycle_rows, stage_rows, human_event_rows) -> list[dict[str, Any]]:
+    seen: dict[str, dict[str, Any]] = {}
+    for row in cycle_rows + stage_rows + human_event_rows:
+        details = row.get("details") if isinstance(row, dict) else None
+        if not isinstance(details, dict):
+            continue
+        evidence_list = details.get("evidence") or []
+        if not isinstance(evidence_list, list):
+            continue
+        for ev in evidence_list:
+            if not isinstance(ev, dict):
+                continue
+            source_id = str(ev.get("source_id") or "")
+            if not source_id:
+                continue
+            if source_id not in seen:
+                seen[source_id] = {
+                    "source_id": source_id,
+                    "title": ev.get("title"),
+                    "url": ev.get("url"),
+                    "publisher": ev.get("publisher"),
+                    "published_at": ev.get("published_at"),
+                    "provider": ev.get("provider"),
+                    "is_inference": bool(ev.get("is_inference", False)),
+                    "clickable": bool(ev.get("url") and str(ev.get("url")).startswith(("http://", "https://"))),
+                    "cited_in": [],
+                }
+            seen[source_id]["cited_in"].append(
+                {
+                    "timestamp": row.get("timestamp"),
+                    "entry_type": row.get("entry_type"),
+                    "stage": row.get("stage"),
+                    "ticker": row.get("ticker"),
+                }
+            )
+    return list(seen.values())
+
+
+_SHELL_HTML = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="180">
   <title>Trading Agent Journal</title>
   <style>
-    :root {{
+    :root {
       color-scheme: light;
       --bg: #f7f8fa;
       --panel: #ffffff;
@@ -40,1443 +434,968 @@ def render_dashboard(journal_path: Path, output_path: Path) -> Path:
       --wait: #1769aa;
       --warn: #b54708;
       --fail: #b42318;
-      --shadow: 0 10px 24px rgba(16, 24, 40, .06);
-      --shadow-soft: 0 4px 14px rgba(16, 24, 40, .05);
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
+    }
+    * { box-sizing: border-box; }
+    body {
       margin: 0;
       background: var(--bg);
       color: var(--text);
       font-family: Arial, Helvetica, sans-serif;
       line-height: 1.45;
-    }}
-    main.dashboard-shell {{ width: min(1680px, calc(100% - 48px)); margin: 22px auto 42px; }}
-    header {{
+    }
+    main.shell { width: min(1680px, calc(100% - 48px)); margin: 22px auto 42px; }
+    header {
       display: flex;
       justify-content: space-between;
       gap: 16px;
       align-items: flex-start;
-      margin-bottom: 18px;
-    }}
-    h1 {{ font-size: 26px; line-height: 1.15; margin: 0 0 6px; letter-spacing: 0; }}
-    .meta {{ color: var(--muted); font-size: 14px; }}
-    .source {{ max-width: 460px; text-align: right; overflow-wrap: anywhere; }}
-    .summary {{
+      margin-bottom: 14px;
+    }
+    h1 { font-size: 24px; margin: 0 0 4px; }
+    h2 { font-size: 18px; margin: 0 0 10px; }
+    h3 { font-size: 14px; margin: 16px 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .meta { color: var(--muted); font-size: 13px; }
+    .source { max-width: 460px; text-align: right; overflow-wrap: anywhere; }
+    .generated { font-size: 12px; color: var(--muted); }
+    nav.tabs {
+      display: flex;
+      gap: 4px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 16px;
+    }
+    .tab-button {
+      background: transparent;
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 6px 6px 0 0;
+      padding: 8px 14px;
+      font-size: 13px;
+      color: var(--muted);
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .tab-button:hover { background: #eef1f5; color: var(--text); }
+    .tab-button.active {
+      background: var(--panel);
+      color: var(--text);
+      border-color: var(--line);
+      border-bottom-color: var(--panel);
+      margin-bottom: -1px;
+      font-weight: 600;
+    }
+    .tab-button.has-new::after {
+      content: ""; display: inline-block; width: 7px; height: 7px;
+      margin-left: 6px; border-radius: 50%; background: #1769aa;
+      vertical-align: 1px;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    .summary {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       gap: 10px;
       margin-bottom: 14px;
-    }}
-    .summary-item, .metric {{
+    }
+    .stat-card {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      box-shadow: var(--shadow-soft);
-    }}
-    .summary-item {{ padding: 13px 14px; min-height: 76px; }}
-    .stat-card {{ position: relative; overflow: hidden; }}
-    .stat-card::before {{
+      padding: 12px 14px;
+      min-height: 70px;
+      position: relative;
+      overflow: hidden;
+    }
+    .stat-card::before {
       content: "";
       position: absolute;
-      left: 0;
-      top: 0;
-      bottom: 0;
+      left: 0; top: 0; bottom: 0;
       width: 4px;
       background: #d9dee7;
-    }}
-    .stat-card.good::before {{ background: #147d4f; }}
-    .stat-card.warn::before {{ background: #b54708; }}
-    .stat-card.info::before {{ background: #1769aa; }}
-    .summary-item span, .metric span {{
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      margin-bottom: 2px;
-    }}
-    .summary-item strong {{ font-size: 14px; font-weight: 700; overflow-wrap: anywhere; }}
-    .stat-value {{ display: block; font-size: 18px; line-height: 1.25; margin-top: 4px; }}
-    .stat-sub {{ display: block; color: var(--muted); font-size: 12px; margin-top: 5px; }}
-    .grid {{
+    }
+    .stat-card.info::before { background: #1769aa; }
+    .stat-card.good::before { background: #147d4f; }
+    .stat-card.warn::before { background: #b54708; }
+    .stat-card span { display: block; color: var(--muted); font-size: 12px; }
+    .stat-card strong { display: block; font-size: 16px; margin-top: 4px; }
+    .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-      gap: 12px;
-      margin-bottom: 18px;
-    }}
-    .metric {{
-      padding: 13px 14px;
-    }}
-    .metric strong {{ font-size: 22px; line-height: 1.15; }}
-    .metric .split {{ display: flex; gap: 8px; flex-wrap: wrap; font-size: 16px; font-weight: 700; }}
-    .human-panel {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: var(--shadow-soft);
-      margin: 0 0 16px;
-      overflow: hidden;
-    }}
-    .human-panel h2 {{
-      font-size: 14px;
-      margin: 0;
-      padding: 10px 12px;
-      border-bottom: 1px solid var(--soft-line);
-      color: #344054;
-    }}
-    .human-list {{
-      max-height: 330px;
-      overflow: auto;
-    }}
-    .human-card {{
-      border-bottom: 1px solid var(--soft-line);
-      font-size: 13px;
-      background: #fff;
-    }}
-    .human-card:last-child {{ border-bottom: 0; }}
-    .human-card summary {{
-      list-style: none;
-      cursor: pointer;
-      padding: 10px 12px;
-    }}
-    .human-card summary::-webkit-details-marker {{ display: none; }}
-    .human-card summary::before {{
-      content: "+";
-      display: inline-grid;
-      place-items: center;
-      width: 18px;
-      height: 18px;
-      border: 1px solid var(--line);
-      border-radius: 50%;
-      margin-right: 8px;
-      color: #344054;
-      font-weight: 700;
-      font-size: 12px;
-    }}
-    .human-card[open] summary::before {{ content: "-"; }}
-    .human-summary-main {{
-      display: inline;
-      font-weight: 700;
-      overflow-wrap: anywhere;
-    }}
-    .human-summary-sub {{
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      margin: 5px 0 0 28px;
-      overflow-wrap: anywhere;
-    }}
-    .human-card-body {{
-      padding: 0 12px 12px 40px;
-    }}
-    .human-steps {{ display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 6px; }}
-    .human-step-chip {{
-      display: inline-flex;
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 2px 7px;
-      background: #f7f8fa;
-      color: #344054;
-      font-size: 12px;
-      font-weight: 700;
-    }}
-    .human-meta {{ display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 6px; }}
-    .human-chip {{
-      display: inline-flex;
-      align-items: center;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 2px 7px;
-      background: #fff;
-      color: #344054;
-      font-size: 12px;
-      font-weight: 700;
-    }}
-    .human-chip.intent {{ border-color: #cfe2ff; background: #f5f9ff; color: #1769aa; }}
-    .human-chip.target {{ border-color: #b7e4c7; background: #f0f9f3; color: #147d4f; }}
-    .human-chip.status {{ border-color: #d9dee7; background: #f7f8fa; color: #344054; }}
-    .human-detail {{ color: #344054; margin-top: 3px; overflow-wrap: anywhere; }}
-    .human-detail span {{ color: var(--muted); font-size: 12px; font-weight: 700; margin-right: 4px; }}
-    .human-target-list {{ display: grid; gap: 3px; margin-top: 3px; }}
-    .human-target-row {{
-      display: grid;
-      grid-template-columns: minmax(72px, auto) 1fr;
-      gap: 8px;
-      align-items: start;
-      color: #344054;
-    }}
-    .human-target-row b {{ color: #17202a; }}
-    .table-wrap {{
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow-x: hidden;
-      overflow-y: auto;
-      box-shadow: var(--shadow);
-      max-height: min(720px, calc(100vh - 260px));
-    }}
-    .table-wrap::-webkit-scrollbar {{ width: 10px; }}
-    .table-wrap::-webkit-scrollbar-track {{ background: #f1f4f8; }}
-    .table-wrap::-webkit-scrollbar-thumb {{ background: #c7ced8; border-radius: 999px; border: 2px solid #f1f4f8; }}
-    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
-    th, td {{
-      border-bottom: 1px solid var(--soft-line);
-      padding: 10px 8px;
-      text-align: left;
-      vertical-align: top;
-      font-size: 13px;
-    }}
-    tbody tr:hover {{ background: #fbfcfe; }}
-    th {{
-      position: sticky;
-      top: 0;
-      z-index: 2;
-      background: #f1f4f8;
-      color: #344054;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .03em;
-      white-space: nowrap;
-    }}
-    tr:last-child td {{ border-bottom: 0; }}
-    .cell-clamp {{
-      display: -webkit-box;
-      -webkit-box-orient: vertical;
-      -webkit-line-clamp: 3;
-      overflow: hidden;
-    }}
-    .summary-cell {{ line-height: 1.35; }}
-    .outcome-cell {{ line-height: 1.35; }}
-    .toolbar {{
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: center;
-      margin: 16px 0 10px;
-      flex-wrap: wrap;
-    }}
-    .filter-group {{ display: flex; gap: 6px; flex-wrap: wrap; }}
-    .filter-button {{
-      border: 1px solid var(--line);
-      background: #fff;
-      border-radius: 999px;
-      padding: 6px 10px;
-      cursor: pointer;
-      font-weight: 700;
-      color: #344054;
-    }}
-    .filter-button.active {{ background: #17202a; color: #fff; border-color: #17202a; }}
-    .journal-row {{ cursor: pointer; }}
-    .journal-row:focus-visible {{ outline: 2px solid #147d4f; outline-offset: -2px; }}
-    .money, .numeric {{ font-family: Consolas, Monaco, monospace; font-variant-numeric: tabular-nums; }}
-    .badge {{
-      display: inline-block;
-      border-radius: 999px;
-      padding: 3px 8px;
-      color: #fff;
-      font-weight: 700;
-      font-size: 12px;
-    }}
-    .BUY {{ background: var(--buy); }}
-    .SELL {{ background: var(--sell); }}
-    .HOLD {{ background: var(--hold); }}
-    .WAIT {{ background: var(--wait); }}
-    .guardrail {{ color: var(--warn); font-weight: 700; font-size: 12px; }}
-    .failed {{ color: var(--fail); font-weight: 700; }}
-    .muted {{ color: var(--muted); }}
-    .time-main {{ font-weight: 700; white-space: nowrap; }}
-    .time-sub {{ color: var(--muted); font-size: 12px; white-space: nowrap; }}
-    .confidence-chip, .llm-chip {{
-      display: inline-block;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 3px 7px;
-      background: #fff;
-      font-size: 12px;
-      font-weight: 700;
-      margin-bottom: 4px;
-    }}
-    .llm-chip.fallback {{ border-color: #f2c94c; background: #fff8df; color: #8a5a00; }}
-    .source-list {{ display: flex; flex-wrap: wrap; gap: 4px; max-width: 100%; }}
-    .source-pill {{
-      display: inline-block;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 2px 7px;
-      background: #fff;
-      color: #344054;
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-    }}
-    .portfolio-mini {{ min-width: 150px; }}
-    .portfolio-line {{ display: flex; justify-content: space-between; gap: 10px; font-size: 12px; margin-bottom: 4px; }}
-    .portfolio-track {{ height: 7px; border-radius: 999px; background: #eef1f5; overflow: hidden; margin-bottom: 7px; }}
-    .portfolio-bar {{ height: 100%; border-radius: inherit; background: linear-gradient(90deg, #147d4f, #6cbf8a); }}
-    .portfolio-pos {{ color: var(--muted); font-size: 12px; }}
-    .portfolio-delta {{
-      display: inline-block;
-      border-radius: 999px;
-      padding: 2px 7px;
-      background: #eef6f1;
-      color: #147d4f;
-      font-size: 12px;
-      font-weight: 700;
-    }}
-    .portfolio-delta.negative {{ background: #fff1f0; color: #b42318; }}
-    .outcome-badge {{
-      display: inline-block;
-      border-radius: 999px;
-      padding: 3px 8px;
-      font-size: 12px;
-      font-weight: 700;
-    }}
-    .outcome-badge.success {{ background: #eef6f1; color: #147d4f; }}
-    .outcome-badge.failed {{ background: #fff1f0; color: #b42318; }}
-    .outcome-badge.neutral {{ background: #f1f4f8; color: #344054; }}
-    .outcome-badge.cancelled {{ background: #fef3c7; color: #92400e; text-decoration: line-through; }}
-    .signal-stack {{ display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }}
-    .signal-pill {{
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      padding: 3px 7px;
-      background: #fff;
-      color: #344054;
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-    }}
-    .signal-pill.good {{ border-color: #b7e4c7; background: #f0f9f3; color: #147d4f; }}
-    .signal-pill.warn {{ border-color: #fed7aa; background: #fff7ed; color: #b54708; }}
-    .signal-pill.muted {{ color: var(--muted); }}
-    .signal-pill.cancelled {{ border-color: #fbbf24; background: #fffbeb; color: #92400e; }}
-    .signal-pill.retry {{ border-color: #93c5fd; background: #eff6ff; color: #1e40af; }}
-    .signal-pill.failed {{ border-color: #fca5a5; background: #fef2f2; color: #991b1b; }}
-    .signal-pill.reversal {{ border-color: #c4b5fd; background: #f5f3ff; color: #5b21b6; }}
-    .summary-signals {{ margin-top: 8px; }}
-    dialog {{
-      width: min(820px, calc(100% - 28px));
-      max-height: min(860px, 92vh);
-      overflow: auto;
-      border: 0;
-      border-radius: 8px;
-      box-shadow: 0 24px 64px rgba(16, 24, 40, .22);
-      padding: 0;
-    }}
-    dialog::backdrop {{ background: rgba(23, 32, 42, .42); }}
-    .modal-head {{
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      align-items: center;
-      padding: 16px 18px;
-      border-bottom: 1px solid var(--line);
-      position: sticky;
-      top: 0;
-      z-index: 3;
-      background: var(--panel);
-    }}
-    .modal-head h2 {{ font-size: 18px; margin: 0; }}
-    .modal-body {{ padding: 16px 18px 18px; }}
-    .modal-body h3 {{ font-size: 13px; margin: 14px 0 6px; color: #344054; }}
-    .modal-body pre {{
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      background: #f7f8fa;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      padding: 10px;
-      font-family: Consolas, Monaco, monospace;
-      font-size: 13px;
-      margin: 0;
-    }}
-    .close-button {{ border: 0; background: transparent; font-size: 22px; cursor: pointer; line-height: 1; }}
-    .alert-panel {{
-      border: 1px solid #fed7aa;
-      background: #fff7ed;
-      border-radius: 8px;
-      padding: 10px 12px;
-      margin-bottom: 12px;
-      color: #9a3412;
-      font-weight: 700;
-    }}
-    .detail-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
       gap: 10px;
-      margin-bottom: 12px;
-    }}
-    .detail-card {{
+      margin-bottom: 14px;
+    }
+    .metric {
+      background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 10px;
-      background: #fff;
-    }}
-    .detail-card.decision-card {{ border-color: #b7e4c7; background: #f0f9f3; }}
-    .detail-card.portfolio-card {{ border-color: #cfe2ff; background: #f5f9ff; }}
-    .detail-card.execution-card {{ border-color: #d9dee7; background: #fbfcfe; }}
-    .detail-card span {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 3px; }}
-    .detail-card strong {{ font-size: 14px; }}
-    .empty-state {{
-      display: none;
-      border: 1px dashed var(--line);
+      padding: 10px 12px;
+    }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { font-size: 18px; }
+    .metric .split { display: flex; gap: 8px; }
+    .metric .split b { font-size: 13px; }
+    .metric .split b.buy { color: var(--buy); }
+    .metric .split b.sell { color: var(--sell); }
+    .metric .split b.hold { color: var(--hold); }
+    .metric .split b.wait { color: var(--wait); }
+    table.store {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      border: 1px solid var(--line);
       border-radius: 8px;
-      background: #fff;
+      overflow: hidden;
+    }
+    table.store th, table.store td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--soft-line);
+      font-size: 13px;
+      vertical-align: top;
+    }
+    table.store th { background: #f1f4f9; color: var(--muted); font-weight: 600; }
+    table.store tr:last-child td { border-bottom: none; }
+    table.store tr.entity-row { cursor: pointer; }
+    table.store tr.entity-row:hover { background: #f8fafc; }
+    table.store tr.entity-row td { user-select: none; -webkit-user-select: none; }
+    .lifecycle-card.entity-row .lc-head,
+    .reply-card.entity-row .rc-meta { cursor: pointer; }
+    .table-scroll { max-height: 520px; overflow: auto; border-radius: 8px; margin-bottom: 14px; }
+    .table-scroll table.store { min-width: 720px; }
+    .table-scroll table.store th { position: sticky; top: 0; z-index: 1; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge.active, .badge.completed, .badge.confirmed { background: #dcfce7; color: #166534; }
+    .badge.inactive, .badge.abandoned, .badge.rejected, .badge.expired, .badge.cancelled { background: #fee2e2; color: #991b1b; }
+    .badge.pending, .badge.queued, .badge.modified { background: #fef3c7; color: #92400e; }
+    .badge.triggered, .badge.filled, .badge.submitted { background: #dbeafe; color: #1e40af; }
+    .badge.skipped, .badge.waiting { background: #f3f4f6; color: #6b7280; }
+    .lifecycle-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+    }
+    .lifecycle-card .lc-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .lifecycle-card .lc-note { font-weight: 600; }
+    .lifecycle-card .lc-meta { color: var(--muted); font-size: 12px; }
+    .lifecycle-card .lc-steps {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .lifecycle-card .lc-step {
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      background: #eef1f5;
       color: var(--muted);
-      padding: 18px;
-      text-align: center;
-      margin-top: 12px;
-    }}
-    .empty-state strong {{ display: block; color: var(--text); margin-bottom: 4px; }}
-    .empty-state.visible {{ display: block; }}
-    @media (max-width: 920px) {{
-      header {{ display: block; }}
-      .source {{ max-width: none; text-align: left; margin-top: 8px; }}
-      .table-wrap {{ overflow: visible; max-height: none; border: 0; box-shadow: none; background: transparent; }}
-      table, tbody, tr, td {{ display: block; width: 100%; }}
-      colgroup, thead {{ display: none; }}
-      table {{ min-width: 0; border-collapse: separate; }}
-      tbody {{ display: grid; gap: 12px; }}
-      tr {{
-        background: var(--panel);
-        border: 1px solid var(--line);
-        border-radius: 8px;
-        box-shadow: var(--shadow-soft);
-        padding: 10px 12px;
-      }}
-      td {{
-        border-bottom: 1px solid var(--soft-line);
-        padding: 9px 0;
-        display: grid;
-        grid-template-columns: 116px 1fr;
-        gap: 10px;
-        align-items: start;
-      }}
-      td:last-child {{ border-bottom: 0; }}
-      td::before {{
-        content: attr(data-label);
-        color: var(--muted);
-        font-size: 11px;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: .03em;
-      }}
-      .cell-clamp {{ -webkit-line-clamp: 4; }}
-      .portfolio-mini {{ min-width: 0; }}
-      .toolbar {{ display: grid; }}
-    }}
-    @media (max-width: 760px) {{
-      main.dashboard-shell {{ width: min(100% - 20px, 1180px); margin-top: 14px; }}
-      .summary, .grid {{ grid-template-columns: 1fr; }}
-    }}
-    @media (max-width: 560px) {{
-      h1 {{ font-size: 22px; }}
-    }}
+    }
+    .lifecycle-card .lc-summary {
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--text);
+    }
+    .lifecycle-card .lc-next-step {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--muted);
+      font-style: italic;
+    }
+    .lifecycle-card .lc-evidence {
+      margin-top: 6px;
+      font-size: 12px;
+    }
+    .lifecycle-card .lc-evidence a { color: var(--wait); text-decoration: none; }
+    .lifecycle-card .lc-evidence a:hover { text-decoration: underline; }
+    .lifecycle-card .lc-evidence .inference { color: var(--warn); font-style: italic; }
+    .reply-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 10px;
+    }
+    .reply-card .rc-meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    .reply-card .rc-note { font-style: italic; color: var(--muted); margin-bottom: 6px; }
+    .reply-card .rc-body { white-space: pre-wrap; }
+    .empty { color: var(--muted); padding: 24px; text-align: center; background: var(--panel); border: 1px dashed var(--line); border-radius: 8px; }
+    .bar {
+      display: flex;
+      height: 8px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #eef1f5;
+      margin-bottom: 3px;
+    }
+    .bar > div { height: 100%; }
+    .bar-labels { display: flex; flex-wrap: wrap; gap: 6px; font-size: 11px; }
+    .refresh-indicator {
+      position: fixed;
+      bottom: 12px;
+      right: 12px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+      color: var(--muted);
+      box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+    }
+    .refresh-indicator.stale { color: var(--warn); border-color: var(--warn); }
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0; z-index: 100;
+      background: rgba(15, 23, 42, 0.45); padding: 4vh 18px;
+    }
+    .modal-backdrop.open { display: flex; align-items: flex-start; justify-content: center; }
+    .modal-card {
+      width: min(920px, 100%); max-height: 92vh; overflow: auto;
+      background: var(--panel); border-radius: 10px; box-shadow: 0 20px 60px rgba(0,0,0,.25);
+    }
+    .modal-head {
+      position: sticky; top: 0; display: flex; justify-content: space-between;
+      align-items: center; gap: 12px; padding: 14px 18px; background: var(--panel);
+      border-bottom: 1px solid var(--line); z-index: 1;
+    }
+    .modal-head h2 { margin: 0; }
+    .modal-close { border: 0; background: #eef1f5; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 13px; }
+    .modal-body { padding: 16px 18px 24px; }
+    .modal-user-section { background: #f8fafc; border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+    .modal-user-section .mu-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 3px; }
+    .modal-user-section .mu-value { font-size: 14px; color: var(--text); }
+    .modal-user-section .mu-value.big { font-size: 20px; font-weight: 700; }
+    .modal-kpi-row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+    .modal-kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; flex: 1; min-width: 120px; }
+    .modal-kpi .mk-label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+    .modal-kpi .mk-value { font-size: 16px; font-weight: 600; margin-top: 2px; }
+    .modal-evidence { margin-bottom: 14px; }
+    .modal-evidence a { color: var(--wait); font-size: 13px; }
+    .modal-section { margin-top: 12px; }
+    .modal-section h3 { margin-top: 0; }
+    .modal-section-content { background: #f8fafc; border-left: 3px solid #d9dee7; padding: 10px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .modal-section pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+    .modal-tech { margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    .modal-tech .tech-inner { padding: 12px 14px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(190px,1fr)); gap: 8px; }
+    .detail-item { background: #f8fafc; border: 1px solid var(--soft-line); border-radius: 6px; padding: 8px 10px; overflow-wrap: anywhere; }
+    .detail-item span { display: block; font-size: 11px; color: var(--muted); text-transform: uppercase; }
+    .modal-rationale { font-size: 13px; line-height: 1.6; color: var(--text); background: #f8fafc; border-left: 3px solid var(--wait); padding: 10px 12px; border-radius: 0 6px 6px 0; margin-bottom: 10px; }
+    .modal-risks { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .modal-risk-tag { background: #fef3c7; color: #92400e; border-radius: 4px; padding: 2px 8px; font-size: 12px; }
+    .modal-guardrail-tag { background: #fee2e2; color: #991b1b; border-radius: 4px; padding: 2px 8px; font-size: 12px; }
+    .copy-button { margin-left: 7px; border: 1px solid var(--line); background: #fff; border-radius: 5px; padding: 2px 7px; color: var(--wait); cursor: pointer; font-size: 11px; transition: background 0.15s, color 0.15s; }
+    .copy-button.copied { background: #dcfce7; color: #166534; border-color: #86efac; }
+    @media (max-width: 760px) {
+      main.shell { width: min(100% - 20px, 1180px); margin-top: 14px; }
+      .summary, .grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <main class="dashboard-shell">
+  <main class="shell">
     <header>
       <div>
         <h1>Trading Agent Journal</h1>
-        <div class="meta">Run: {html.escape(output_path.parent.name)} | Tickers: {html.escape(stats["tickers"])} | Generated: {html.escape(_format_datetime(datetime.now().isoformat()))}</div>
+        <div class="meta" id="run-meta">Loading…</div>
       </div>
-      <div class="meta source">Source: {html.escape(str(journal_path))}</div>
+      <div class="meta source" id="source-meta"></div>
     </header>
-    <section class="summary" aria-label="Run summary">
-      <div class="summary-item stat-card info"><span>Run summary</span><strong class="stat-value">{html.escape(stats["run_summary_short"])}</strong><small class="stat-sub">{html.escape(stats["run_summary_detail"])}</small></div>
-      <div class="summary-item stat-card {stats["recovery_class"]}"><span>Recovery signal</span><strong class="stat-value">{stats["guardrails"]} guardrails, {stats["fallbacks"]} fallbacks</strong><small class="stat-sub">{stats["retries"]} retries recorded</small></div>
-      <div class="summary-item stat-card {stats["health_class"]}"><span>Execution health</span><strong class="stat-value">{stats["failures"]} failures</strong><small class="stat-sub">Across {stats["cycle_count"]} cycles</small></div>
-      <div class="summary-item stat-card info"><span>Portfolio outcome</span><strong class="stat-value">{html.escape(stats["portfolio_outcome"])}</strong><small class="stat-sub">Latest snapshot</small></div>
-      <div class="summary-item stat-card {stats["portfolio_class"]}"><span>Portfolio path</span><strong class="stat-value">{html.escape(stats["portfolio_path_short"])}</strong><small class="stat-sub">{html.escape(stats["portfolio_path_detail"])}</small></div>
-    </section>
-    <section class="grid" aria-label="Run metrics">
-      <div class="metric"><span>Total cycles</span><strong>{stats["cycle_count"]}</strong></div>
-      <div class="metric"><span>Progress events</span><strong>{stats["stage_count"]}</strong></div>
-      <div class="metric"><span>Actions</span><strong class="split"><b>BUY {stats["actions"].get("BUY", 0)}</b><b>SELL {stats["actions"].get("SELL", 0)}</b><b>HOLD {stats["actions"].get("HOLD", 0)}</b><b>WAIT {stats["actions"].get("WAIT", 0)}</b></strong></div>
-      <div class="metric"><span>Guardrails</span><strong>{stats["guardrails"]}</strong></div>
-      <div class="metric"><span>Failures / retries</span><strong>{stats["failures"]} / {stats["retries"]}</strong></div>
-      <div class="metric"><span>Human messages</span><strong>{stats["human_event_count"]}</strong></div>
-    </section>
-    {human_events_html}
-    <section class="toolbar" aria-label="Journal controls">
-      <div class="filter-group">
-        <button class="filter-button active" type="button" data-filter="all" onclick="filterRows('all', this)">All</button>
-        <button class="filter-button" type="button" data-filter="trades" onclick="filterRows('trades', this)">Trades</button>
-        <button class="filter-button" type="button" data-filter="failed" onclick="filterRows('failed', this)">Failed</button>
-        <button class="filter-button" type="button" data-filter="guardrails" onclick="filterRows('guardrails', this)">Guardrails</button>
-      </div>
-    </section>
-    <div class="table-wrap">
-      <table>
-        <colgroup>
-          <col style="width:11%">
-          <col style="width:11%">
-          <col style="width:42%">
-          <col style="width:13%">
-          <col style="width:13%">
-          <col style="width:10%">
-        </colgroup>
-        <thead>
-          <tr>
-            <th>Timestamp</th>
-            <th>Action</th>
-            <th>Summary</th>
-            <th>Cash movement</th>
-            <th>Diversification</th>
-            <th>Outcome</th>
-          </tr>
-        </thead>
-        <tbody>{table_rows or _empty_row()}</tbody>
-      </table>
-    </div>
-    <div id="emptyState" class="empty-state" aria-live="polite">
-      <strong>No rows to show</strong>
-      <span>Select another filter to inspect the journal.</span>
-    </div>
-    <dialog id="detailDialog">
-      <div class="modal-head">
-        <h2 id="detailTitle">Cycle details</h2>
-        <button class="close-button" type="button" onclick="document.getElementById('detailDialog').close()" aria-label="Close">&times;</button>
-      </div>
-      <div class="modal-body" id="detailBody"></div>
-    </dialog>
+    <nav class="tabs" id="tab-nav">
+      <button class="tab-button active" data-tab="overview" onclick="showTab('overview', this)">Overview</button>
+      <button class="tab-button" data-tab="trades" onclick="showTab('trades', this)">Trades</button>
+      <button class="tab-button" data-tab="human" onclick="showTab('human', this)">Human Messages</button>
+      <button class="tab-button" data-tab="confirmations" onclick="showTab('confirmations', this)">Confirmations</button>
+      <button class="tab-button" data-tab="scheduled" onclick="showTab('scheduled', this)">Scheduled &amp; Conditional</button>
+      <button class="tab-button" data-tab="constraints" onclick="showTab('constraints', this)">Constraints</button>
+      <button class="tab-button" data-tab="replies" onclick="showTab('replies', this)">Agent Replies</button>
+      <button class="tab-button" data-tab="diversification" onclick="showTab('diversification', this)">Diversification</button>
+      <button class="tab-button" data-tab="evidence" onclick="showTab('evidence', this)">Evidence</button>
+      <button class="tab-button" data-tab="audit" onclick="showTab('audit', this)">Technical Audit</button>
+    </nav>
+    <section id="tab-overview" class="tab-panel active"></section>
+    <section id="tab-trades" class="tab-panel"></section>
+    <section id="tab-human" class="tab-panel"></section>
+    <section id="tab-confirmations" class="tab-panel"></section>
+    <section id="tab-scheduled" class="tab-panel"></section>
+    <section id="tab-constraints" class="tab-panel"></section>
+    <section id="tab-replies" class="tab-panel"></section>
+    <section id="tab-diversification" class="tab-panel"></section>
+    <section id="tab-evidence" class="tab-panel"></section>
+    <section id="tab-audit" class="tab-panel"></section>
   </main>
+  <div class="modal-backdrop" id="entity-modal" onclick="closeModal(event)">
+    <article class="modal-card" onclick="event.stopPropagation()">
+      <div class="modal-head"><h2 id="modal-title">Details</h2><button class="modal-close" onclick="closeModal()">Close</button></div>
+      <div class="modal-body" id="modal-body"></div>
+    </article>
+  </div>
+  <div class="refresh-indicator" id="refresh-indicator">—</div>
   <script>
-    const journalDetails = {details_json};
-    function escapeHtml(value) {{
-      return String(value || "-")
+    let DASHBOARD_DATA = null;
+    let activeTab = "overview";
+    let modalEntityId = null;
+    let entityIndex = {};
+
+    function showTab(name, button) {
+      document.querySelectorAll(".tab-button").forEach((b) => b.classList.remove("active"));
+      if (button) button.classList.add("active");
+      document.querySelectorAll(".tab-panel").forEach((p) => {
+        p.classList.toggle("active", p.id === "tab-" + name);
+      });
+      activeTab = name;
+      renderTab(name);
+      markTabSeen(name);
+    }
+
+    function esc(value) {
+      return String(value == null ? "-" : value)
         .replaceAll("&", "&amp;")
         .replaceAll("<", "&lt;")
         .replaceAll(">", "&gt;");
-    }}
-    function block(title, text) {{
-      return `<h3>${{title}}</h3><pre>${{escapeHtml(text)}}</pre>`;
-    }}
-    function card(label, value, cssClass = "") {{
-      return `<div class="detail-card ${{cssClass}}"><span>${{label}}</span><strong>${{escapeHtml(value)}}</strong></div>`;
-    }}
-    function showDetails(index) {{
-      const item = journalDetails[index];
-      document.getElementById("detailTitle").textContent = `${{item.timestamp}} | ${{item.ticker}} ${{item.action}}`;
-      document.getElementById("detailBody").innerHTML =
-        item.alert_html +
-        `<div class="detail-grid">
-          ${{card("Decision", item.action + " " + item.ticker, "decision-card")}}
-          ${{card("Draft", item.draft_short)}}
-          ${{card("Quantity", item.quantity_short)}}
-          ${{card("Confidence", item.confidence)}}
-          ${{card("Portfolio", item.portfolio_short, "portfolio-card")}}
-          ${{card("Execution", item.outcome_short, "execution-card")}}
-          ${{card("Order price", item.order_price_short)}}
-          ${{card("Fill price", item.fill_price_short)}}
-          ${{card("LLM", item.llm_short)}}
-          ${{card("Data readiness", item.data_short)}}
-        </div>` +
-        block("Summary", item.cycle_summary) +
-        block("Rationale", item.rationale) +
-        block("Rationale details", item.rationale_markdown) +
-        block("Decision audit", item.decision_audit_markdown) +
-        block("Technical signals", item.technical_markdown) +
-        block("Guardrails", item.guardrails_markdown) +
-        block("Failures", item.failures_markdown) +
-        block("LLM provider", item.llm_markdown) +
-        block("Portfolio after", item.portfolio_markdown) +
-        block("Sector diversification", item.diversification_text) +
-        block("Outcome", item.outcome) +
-        block("Structured details", item.structured_details);
-      document.getElementById("detailDialog").showModal();
-    }}
-    function handleRowKey(event, index) {{
-      if (event.key === "Enter" || event.key === " ") {{
-        event.preventDefault();
-        showDetails(index);
-      }}
-    }}
-    function filterRows(filter, button) {{
-      document.querySelectorAll(".filter-button").forEach((item) => item.classList.remove("active"));
-      button.classList.add("active");
-      let visibleCount = 0;
-      document.querySelectorAll(".journal-row").forEach((row) => {{
-        const matchesFilter =
-          filter === "all" ||
-          row.dataset.kind === filter ||
-          (filter === "guardrails" && row.dataset.guardrails === "1");
-        row.style.display = matchesFilter ? "" : "none";
-        if (matchesFilter) visibleCount += 1;
-      }});
-      updateEmptyState(filter, visibleCount);
-    }}
-    function updateEmptyState(filter, visibleCount) {{
-      const emptyState = document.getElementById("emptyState");
-      if (!emptyState) return;
-      const messages = {{
-        all: ["No journal entries", "Run the agent to create the first cycle."],
-        trades: ["No BUY or SELL cycles", "The agent only held, waited, or no trade was attempted."],
-        failed: ["No failed cycles", "All visible cycles completed without a failed execution."],
-        guardrails: ["No guardrails triggered", "No data quality or safety guardrails fired in this run."]
-      }};
-      const message = messages[filter] || messages.all;
-      emptyState.querySelector("strong").textContent = message[0];
-      emptyState.querySelector("span").textContent = message[1];
-      emptyState.classList.toggle("visible", visibleCount === 0);
-    }}
+    }
+
+    function escAttr(value) {
+      return esc(value).replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+    }
+
+    function entityRow(entityId) {
+      return ' class="entity-row" data-entity-id="' + escAttr(entityId) + '" onclick="openEntity(this.dataset.entityId)"';
+    }
+
+    function buildEntityIndex(data) {
+      const index = {};
+      const add = (item, id, title) => {
+        if (!item) return;
+        item.entity_id = item.entity_id || id;
+        item.entity_title = title;
+        index[item.entity_id] = item;
+      };
+      (data.cycles || []).forEach((x, i) => add(x, "cycle:" + i, (x.action || "Decision") + " " + (x.ticker || "")));
+      (data.human_events || []).forEach((x, i) => add(x, "human:" + i, "Human message"));
+      (data.pending_confirmations || []).forEach((x, i) => add(x, "confirmation:" + (x.confirmation_id || i), "Confirmation " + (x.confirmation_id || "")));
+      (data.scheduled_actions || []).forEach((x, i) => add(x, "scheduled:" + (x.action_id || i), "Scheduled action"));
+      (data.conditional_orders || []).forEach((x, i) => add(x, "conditional:" + (x.order_id || i), "Conditional order"));
+      (data.constraints || []).forEach((x, i) => add(x, "constraint:" + (x.constraint_id || i), "Constraint"));
+      (data.agent_replies || []).forEach((x, i) => add(x, "reply:" + i, "Agent reply"));
+      (data.evidence || []).forEach((x, i) => add(x, "evidence:" + (x.source_id || i), "Evidence source"));
+      (data.instruction_ledger || []).forEach((x, i) => add(x, "ledger:" + (x.instruction_id || x.request_id || i), "Instruction"));
+      (data.stages || []).forEach((x, i) => add(x, "stage:" + i, "Stage " + (x.stage || "")));
+      entityIndex = index;
+    }
+
+    function detailValue(value) {
+      if (value == null || value === "") return "-";
+      if (typeof value === "object") return esc(JSON.stringify(value));
+      return esc(value);
+    }
+
+    function isShortScalar(value) {
+      if (value == null || typeof value === "object") return false;
+      const text = String(value);
+      return text.length <= 80 && !text.includes("\\n");
+    }
+
+    function modalTextSection(title, value, raw) {
+      if (value == null || value === "" || (Array.isArray(value) && !value.length)) return "";
+      const body = typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+      const content = raw ? '<pre>' + esc(body) + '</pre>' : esc(body);
+      return '<section class="modal-section"><h3>' + esc(title) + '</h3><div class="modal-section-content">' + content + '</div></section>';
+    }
+
+    function renderEntityModal() {
+      if (!modalEntityId) return;
+      const item = entityIndex[modalEntityId];
+      if (!item) return;
+      document.getElementById("modal-title").textContent = item.entity_title || "Details";
+      const details = item.details || {};
+
+      let html = "";
+
+      const action = item.action || item.status || item.outcome || details.outcome_type || "";
+      const ticker = item.ticker && item.ticker !== "HUMAN" ? item.ticker : "";
+      const confidence = item.confidence != null ? Math.round(item.confidence * 100) + "%" : null;
+      if (action || ticker) {
+        html += '<div class="modal-kpi-row">';
+        if (ticker) html += '<div class="modal-kpi"><div class="mk-label">Ticker</div><div class="mk-value">' + esc(ticker) + '</div></div>';
+        if (action) html += '<div class="modal-kpi"><div class="mk-label">Decision</div><div class="mk-value">' + badge(action) + '</div></div>';
+        if (confidence) html += '<div class="modal-kpi"><div class="mk-label">Confidence</div><div class="mk-value">' + esc(confidence) + '</div></div>';
+        if (item.quantity != null && item.quantity > 0) html += '<div class="modal-kpi"><div class="mk-label">Quantity</div><div class="mk-value">' + esc(item.quantity) + '</div></div>';
+        html += '</div>';
+      }
+
+      const userRequest = item.original_note || details.original_note;
+      const agentReply = item.reply || details.agent_reply;
+      const rawSummary = details.user_summary || item.cycle_summary || details.user_facing_summary;
+      const userSummary = rawSummary && rawSummary !== userRequest && rawSummary !== agentReply ? rawSummary : null;
+      if (userRequest) {
+        html += '<div class="modal-user-section"><div class="mu-label">Your request</div><div class="mu-value">' + esc(userRequest) + '</div></div>';
+      }
+      if (agentReply && agentReply !== userRequest) {
+        html += '<div class="modal-user-section"><div class="mu-label">What happened</div><div class="mu-value">' + esc(agentReply) + '</div></div>';
+      } else if (userSummary) {
+        html += '<div class="modal-user-section"><div class="mu-label">What happened</div><div class="mu-value">' + esc(userSummary) + '</div></div>';
+      }
+
+      const rationale = item.rationale || details.rationale;
+      if (rationale) {
+        html += '<div class="modal-rationale">' + esc(rationale) + '</div>';
+      }
+
+      const risks = (details.risks || []);
+      const guardrails = (item.guardrails_triggered || details.guardrails_triggered || []);
+      if (risks.length || guardrails.length) {
+        html += '<div class="modal-risks">';
+        for (const r of risks) html += '<span class="modal-risk-tag">⚠ ' + esc(r) + '</span>';
+        for (const g of guardrails) html += '<span class="modal-guardrail-tag">🔒 ' + esc(g.replace("guardrail:", "")) + '</span>';
+        html += '</div>';
+      }
+
+      const evidence = (details.evidence || item.evidence || []);
+      if (evidence.length) {
+        html += '<div class="modal-evidence">' + evidenceLinks(evidence) + '</div>';
+      }
+
+      const ops = item.proposed_operations || details.proposed_operations || details.operations || [];
+      if (ops.length) {
+        html += '<div class="modal-user-section"><div class="mu-label">Proposed operations</div>';
+        for (const op of ops) {
+          const side = ((op.action || op.side || op.intent_type || "").replace("forced_","").toUpperCase());
+          const opTicker = op.ticker || op.symbol || "-";
+          const qty = op.quantity || op.requested_quantity ? " × " + (op.quantity || op.requested_quantity) : "";
+          const notional = op.notional || op.requested_notional_usd ? " ($" + (op.notional || op.requested_notional_usd) + ")" : "";
+          html += '<div style="margin-top:6px"><span class="badge ' + side.toLowerCase() + '">' + esc(side) + '</span> ' + esc(opTicker) + esc(qty) + '<span style="color:var(--muted)">' + esc(notional) + '</span></div>';
+        }
+        html += '</div>';
+      }
+
+      const nextStep = details.next_step;
+      if (nextStep) {
+        html += '<div style="font-size:13px;color:var(--muted);margin-top:6px;font-style:italic">Next: ' + esc(nextStep) + '</div>';
+      }
+
+      const timeline = item.events || details.timeline || details.lifecycle;
+      if (timeline && timeline.length) {
+        html += '<div class="modal-user-section" style="margin-top:12px"><div class="mu-label">Timeline</div>';
+        for (const ev of timeline) {
+          html += '<div style="margin-top:6px;font-size:13px"><span class="badge ' + esc((ev.status||"").toLowerCase()) + '">' + esc(ev.status||"-") + '</span> ' + fmtTime(ev.timestamp) + (ev.note ? ' — ' + esc((ev.note||"").slice(0,120)) : "") + '</div>';
+        }
+        html += '</div>';
+      }
+
+      const preferred = ["timestamp","ticker","action","outcome","status","confidence","quantity","confirmation_id","workflow_status","instruction_id","request_id"];
+      let cards = "";
+      for (const key of preferred) {
+        if (!isShortScalar(item[key])) continue;
+        cards += '<div class="detail-item"><span>' + esc(key.replaceAll("_"," ")) + '</span>' + detailValue(item[key]) + '</div>';
+      }
+
+      const technical = { decision: details.decision, technical_opinion: details.technical_opinion, risk_assessment: details.risk_assessment, market_snapshot: details.market_snapshot, technical_details: details.technical_details, constraints_checked: details.constraints_checked };
+      Object.keys(technical).forEach(k => technical[k] == null && delete technical[k]);
+      const execution = details.execution_result || item.execution_result;
+      const portfolioRisk = { portfolio_after: item.portfolio_after || details.portfolio_after, risk_assessment: details.risk_assessment, risk_limits: details.risk_limits };
+      Object.keys(portfolioRisk).forEach(k => portfolioRisk[k] == null && delete portfolioRisk[k]);
+
+      let techHtml = "";
+      if (cards) techHtml += '<div class="detail-grid" style="margin-bottom:10px">' + cards + '</div>';
+      if (execution) techHtml += modalTextSection("Execution result", execution, true);
+      if (Object.keys(portfolioRisk).length) techHtml += modalTextSection("Portfolio / Risk", portfolioRisk, true);
+      if (Object.keys(technical).length) techHtml += modalTextSection("Market / Technical", technical, true);
+      techHtml += modalTextSection("Complete raw details", item.details || item, true);
+
+      if (techHtml) {
+        html += '<div class="modal-tech" id="modal-tech-section">';
+        html += '<h3 style="padding:10px 14px;margin:0;background:#f1f4f9;border-bottom:1px solid var(--line)">Technical details</h3>';
+        html += '<div class="tech-inner" id="modal-tech-inner">' + techHtml + '</div>';
+        html += '</div>';
+      }
+
+      document.getElementById("modal-body").innerHTML = html;
+    }
+
+    async function copyConfirmationId(value, event) {
+      if (event) event.stopPropagation();
+      const btn = event && event.target;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(value);
+        } else {
+          const textarea = document.createElement("textarea");
+          textarea.value = value;
+          textarea.style.position = "fixed";
+          textarea.style.opacity = "0";
+          document.body.appendChild(textarea);
+          textarea.select();
+          document.execCommand("copy");
+          textarea.remove();
+        }
+      } catch (error) { /* silent fail */ }
+      if (btn) {
+        const original = btn.textContent;
+        btn.textContent = "✓ Copied";
+        btn.classList.add("copied");
+        setTimeout(() => { btn.textContent = original; btn.classList.remove("copied"); }, 1500);
+      }
+    }
+
+    function openEntity(entityId) {
+      modalEntityId = entityId;
+      renderEntityModal();
+      document.getElementById("entity-modal").classList.add("open");
+    }
+
+    function closeModal(event) {
+      if (event && event.target !== document.getElementById("entity-modal")) return;
+      modalEntityId = null;
+      document.getElementById("entity-modal").classList.remove("open");
+    }
+
+    function tabSignature(name, data) {
+      const sources = {
+        overview: [data.generated_at, (data.cycles || []).length],
+        trades: (data.cycles || []).map(x => [x.entity_id, x.action, x.outcome]),
+        human: (data.human_events || []).map(x => [x.note_id, x.statuses]),
+        confirmations: (data.pending_confirmations || []).map(x => [x.confirmation_id, x.status]),
+        scheduled: [(data.scheduled_actions || []).map(x => [x.action_id, x.status]), (data.conditional_orders || []).map(x => [x.order_id, x.status])],
+        constraints: (data.constraints || []).map(x => [x.constraint_id, x.active]),
+        replies: (data.agent_replies || []).map(x => x.timestamp),
+        diversification: data.diversification_series || [], evidence: (data.evidence || []).map(x => x.source_id),
+        audit: [(data.instruction_ledger || []).map(x => [x.request_id, x.status, x.updated_at]), (data.stages || []).length],
+      };
+      return JSON.stringify(sources[name] || []);
+    }
+
+    function seenKey(name) { return "dashboardSeen:" + (DASHBOARD_DATA ? DASHBOARD_DATA.run_dir : "run") + ":" + name; }
+
+    function markTabSeen(name) {
+      if (!DASHBOARD_DATA) return;
+      localStorage.setItem(seenKey(name), tabSignature(name, DASHBOARD_DATA));
+      const button = document.querySelector('.tab-button[data-tab="' + name + '"]');
+      if (button) button.classList.remove("has-new");
+    }
+
+    function updateNoveltyDots(data) {
+      document.querySelectorAll(".tab-button").forEach(button => {
+        const name = button.dataset.tab;
+        const changed = tabHasContent(name, data) && localStorage.getItem(seenKey(name)) !== tabSignature(name, data);
+        button.classList.toggle("has-new", changed && name !== activeTab);
+      });
+      markTabSeen(activeTab);
+    }
+
+    function tabHasContent(name, data) {
+      const counts = {
+        overview: (data.cycles || []).length + (data.human_events || []).length + (data.pending_confirmations || []).length,
+        trades: (data.cycles || []).length,
+        human: (data.human_events || []).length,
+        confirmations: (data.pending_confirmations || []).length,
+        scheduled: (data.scheduled_actions || []).length + (data.conditional_orders || []).length,
+        constraints: (data.constraints || []).length,
+        replies: (data.agent_replies || []).length,
+        diversification: (data.diversification_series || []).length,
+        evidence: (data.evidence || []).length,
+        audit: (data.instruction_ledger || []).length + (data.stages || []).length,
+      };
+      return (counts[name] || 0) > 0;
+    }
+
+    function itemTimestamp(item) {
+      const events = item && item.events;
+      return item && (item.updated_at || item.timestamp || item.created_at || item.published_at || item.triggered_at) || (events && events.length ? events[events.length - 1].timestamp : null) || "";
+    }
+
+    function newestFirst(items) {
+      return [...(items || [])].sort((a, b) => String(itemTimestamp(b)).localeCompare(String(itemTimestamp(a))));
+    }
+
+    function normalizeNewestFirst(data) {
+      for (const key of ["cycles", "human_events", "stages", "constraints", "scheduled_actions", "conditional_orders", "pending_confirmations", "instruction_ledger", "agent_replies", "diversification_series", "evidence"]) {
+        data[key] = newestFirst(data[key]);
+      }
+    }
+
+    function wrapScrollableTables(panel) {
+      panel.querySelectorAll("table.store").forEach(table => {
+        if (table.parentElement && table.parentElement.classList.contains("table-scroll")) return;
+        const wrapper = document.createElement("div");
+        wrapper.className = "table-scroll";
+        table.parentNode.insertBefore(wrapper, table);
+        wrapper.appendChild(table);
+      });
+    }
+
+    function saveScrollPositions() {
+      const positions = {};
+      document.querySelectorAll(".table-scroll").forEach((el, i) => { positions[i] = el.scrollTop; });
+      return positions;
+    }
+
+    function restoreScrollPositions(positions) {
+      document.querySelectorAll(".table-scroll").forEach((el, i) => { if (positions[i] != null) el.scrollTop = positions[i]; });
+    }
+
+    function fmtTime(ts) {
+      if (!ts) return "-";
+      try {
+        const d = new Date(ts);
+        return d.toLocaleString();
+      } catch (e) { return ts; }
+    }
+
+    function badge(status) {
+      const cls = (status || "").toLowerCase();
+      return '<span class="badge ' + cls + '">' + esc(status || "-") + '</span>';
+    }
+
+    function sectorBar(breakdown) {
+      if (!breakdown || !Object.keys(breakdown).length) return '<span class="empty">—</span>';
+      const COLORS = {
+        technology: "#1769aa", automotive: "#147d4f", manufacturing: "#b54708",
+        energy: "#b42318", healthcare: "#5b21b6", finance: "#0e7490",
+        consumer: "#92400e", materials: "#0f766e", utilities: "#a16207",
+        real_estate: "#be185d", communication: "#1d4ed8", industrials: "#7c2d12",
+        bonds: "#475569", cash: "#94a3b8", crypto: "#db2777", other: "#667085",
+      };
+      let bars = "";
+      let labels = "";
+      for (const [sector, pct] of Object.entries(breakdown)) {
+        const color = COLORS[sector] || "#667085";
+        bars += '<div style="width:' + pct + '%;background:' + color + '" title="' + esc(sector) + ' ' + pct + '%"></div>';
+        labels += '<span style="color:' + color + '">' + esc(sector.slice(0, 4)) + ' ' + pct + '%</span>';
+      }
+      return '<div class="bar">' + bars + '</div><div class="bar-labels">' + labels + '</div>';
+    }
+
+    function evidenceLinks(evidenceList) {
+      if (!evidenceList || !evidenceList.length) return "";
+      let html = '<div class="lc-evidence"><strong>Evidence:</strong><ul style="margin:2px 0 0 16px;padding:0">';
+      for (const ev of evidenceList) {
+        if (ev.is_inference) {
+          html += '<li><span class="inference">[inference]</span> ' + esc(ev.title || ev.excerpt || "") + '</li>';
+        } else if (ev.url && (ev.url.startsWith("http://") || ev.url.startsWith("https://"))) {
+          html += '<li><a href="' + esc(ev.url) + '" target="_blank" rel="noopener">' + esc(ev.title || ev.url) + '</a> <span style="color:#5d6978">(' + esc(ev.publisher || ev.provider || "") + ')</span></li>';
+        } else {
+          html += '<li>' + esc(ev.title || ev.excerpt || "") + ' <span style="color:#5d6978">(' + esc(ev.provider || "") + ')</span></li>';
+        }
+      }
+      html += '</ul></div>';
+      return html;
+    }
+
+    let _lastTabFingerprint = {};
+
+    function renderTab(name) {
+      if (!DASHBOARD_DATA) return;
+      const panel = document.getElementById("tab-" + name);
+      if (!panel) return;
+      const fingerprint = tabSignature(name, DASHBOARD_DATA);
+      if (_lastTabFingerprint[name] === fingerprint && panel.children.length > 0) return;
+      _lastTabFingerprint[name] = fingerprint;
+      const renderers = {
+        overview: renderOverview,
+        trades: renderTrades,
+        human: renderHuman,
+        confirmations: renderConfirmations,
+        scheduled: renderScheduled,
+        constraints: renderConstraints,
+        replies: renderReplies,
+        diversification: renderDiversification,
+        evidence: renderEvidence,
+        audit: renderAudit,
+      };
+      panel.innerHTML = (renderers[name] || renderOverview)(DASHBOARD_DATA);
+      wrapScrollableTables(panel);
+    }
+
+    function renderOverview(data) {
+      const s = data.stats;
+      const actions = s.actions || {};
+      let html = '<h2>Run Summary</h2>';
+      html += '<div class="summary">';
+      html += '<div class="stat-card info"><span>Cycles</span><strong>' + s.cycle_count + '</strong></div>';
+      html += '<div class="stat-card info"><span>Human messages</span><strong>' + s.human_event_count + '</strong></div>';
+      html += '<div class="stat-card ' + (s.failures ? "warn" : "good") + '"><span>Failures</span><strong>' + s.failures + '</strong></div>';
+      html += '<div class="stat-card ' + (s.guardrails || s.fallbacks ? "warn" : "good") + '"><span>Guardrails / Fallbacks</span><strong>' + s.guardrails + ' / ' + s.fallbacks + '</strong></div>';
+      html += '<div class="stat-card info"><span>Retries</span><strong>' + s.retries + '</strong></div>';
+      html += '</div>';
+      html += '<div class="grid">';
+      html += '<div class="metric"><span>BUY</span><strong style="color:#147d4f">' + (actions.BUY || 0) + '</strong></div>';
+      html += '<div class="metric"><span>SELL</span><strong style="color:#b42318">' + (actions.SELL || 0) + '</strong></div>';
+      html += '<div class="metric"><span>HOLD</span><strong style="color:#667085">' + (actions.HOLD || 0) + '</strong></div>';
+      html += '<div class="metric"><span>WAIT</span><strong style="color:#1769aa">' + (actions.WAIT || 0) + '</strong></div>';
+      html += '<div class="metric"><span>Tickers</span><strong>' + esc(s.tickers) + '</strong></div>';
+      html += '<div class="metric"><span>Pending confirmations</span><strong>' + (data.pending_confirmations || []).filter(c => c.status === "pending").length + '</strong></div>';
+      html += '</div>';
+      html += '<h3>Last 5 cycles</h3>';
+      const recent = (data.cycles || []).slice(0, 5);
+      if (!recent.length) {
+        html += '<div class="empty">No cycles recorded yet.</div>';
+      } else {
+        html += '<table class="store"><thead><tr><th>Timestamp</th><th>Ticker</th><th>Action</th><th>Outcome</th><th>Summary</th></tr></thead><tbody>';
+        for (const c of recent) {
+          html += '<tr' + entityRow(c.entity_id) + '><td>' + fmtTime(c.timestamp) + '</td><td>' + esc(c.ticker) + '</td><td>' + esc(c.action) + '</td><td>' + badge(c.outcome) + '</td><td>' + esc((c.cycle_summary || c.rationale || "").slice(0, 160)) + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      return html;
+    }
+
+    function renderTrades(data) {
+      const cycles = data.cycles || [];
+      if (!cycles.length) return '<h2>Decisions</h2><div class="empty">No decisions recorded.</div>';
+      let html = '<h2>Decisions</h2><p class="meta">BUY, SELL, HOLD and WAIT are all retained. Select a row for the complete rationale and technical context.</p>';
+      html += '<table class="store"><thead><tr><th>Timestamp</th><th>Ticker</th><th>Action</th><th>Outcome</th><th>Summary</th></tr></thead><tbody>';
+      for (const c of cycles) {
+        html += '<tr' + entityRow(c.entity_id) + '><td>' + fmtTime(c.timestamp) + '</td><td>' + esc(c.ticker) + '</td><td>' + esc(c.action) + '</td><td>' + badge(c.outcome) + '</td><td>' + esc((c.cycle_summary || c.rationale || "").slice(0, 180)) + '</td></tr>';
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function renderHuman(data) {
+      const groups = data.human_events || [];
+      if (!groups.length) return '<h2>Human Messages</h2><div class="empty">No human messages in this run.</div>';
+      let html = '<h2>Human Messages</h2>';
+      html += '<p class="meta">Each card is one request lifecycle: received → resolved → queued → active → completed/cancelled. Intermediate states are grouped, never duplicated.</p>';
+      for (const g of groups.slice(0, 30)) {
+        const first = g.events[0] || {};
+        const last = g.events[g.events.length - 1] || {};
+        const details = g.details || {};
+        const userSummary = details.user_summary || first.note || "";
+        const nextStep = details.next_step || "";
+        const evidence = details.evidence || [];
+        const outcomeType = details.outcome_type || "";
+        html += '<div class="lifecycle-card entity-row" data-entity-id="' + escAttr(g.entity_id) + '" onclick="openEntity(this.dataset.entityId)">';
+        html += '<div class="lc-head"><span class="lc-note">' + esc((g.original_note || first.note || "").slice(0, 160)) + '</span><span class="lc-meta">' + fmtTime(last.timestamp) + '</span></div>';
+        html += '<div class="lc-meta">Tickers: ' + esc(g.tickers.join(", ") || "-") + ' &middot; Outcome: <code>' + esc(outcomeType) + '</code></div>';
+        if (userSummary && userSummary !== first.note) {
+          html += '<div class="lc-summary">' + esc(userSummary) + '</div>';
+        }
+        if (nextStep) {
+          html += '<div class="lc-next-step">Next: ' + esc(nextStep) + '</div>';
+        }
+        html += '<div class="lc-steps">';
+        for (const ev of g.events) {
+          html += '<span class="lc-step">' + esc(ev.status) + ' &middot; ' + fmtTime(ev.timestamp) + '</span>';
+        }
+        html += '</div>';
+        html += evidenceLinks(evidence);
+        html += '</div>';
+      }
+      return html;
+    }
+
+    function renderConfirmations(data) {
+      const items = data.pending_confirmations || [];
+      if (!items.length) return '<h2>Confirmations</h2><div class="empty">No pending confirmations in this run.</div>';
+      let html = '<h2>Confirmations</h2>';
+      html += '<p class="meta">Risky or ambiguous proposals awaiting user response. Reply with "confirm CF-XXXX", "reject CF-XXXX", or "confirm CF-XXXX but &lt;modification&gt;".</p>';
+      for (const c of items) {
+        const ops = c.proposed_operations || [];
+        const details = c.details || {};
+        const categories = (details.categories || details.sector_categories || []);
+        const actions = ops.map(o => ((o.action || o.side || o.intent_type || "").replace("forced_","").toUpperCase() + (o.ticker ? " " + o.ticker : "") + (o.quantity ? " ×" + o.quantity : "") + (o.notional || o.requested_notional_usd ? " $" + (o.notional || o.requested_notional_usd) : "")).trim()).filter(Boolean);
+        html += '<div class="lifecycle-card entity-row" data-entity-id="' + escAttr(c.entity_id) + '" onclick="openEntity(this.dataset.entityId)">';
+        html += '<div class="lc-head">';
+        html += '<span class="lc-note"><code>' + esc(c.confirmation_id) + '</code><button class="copy-button" data-confirmation-id="' + escAttr(c.confirmation_id) + '" onclick="copyConfirmationId(this.dataset.confirmationId, event)">Copy</button></span>';
+        html += '<span>' + badge(c.status) + '</span>';
+        html += '</div>';
+        html += '<div class="lc-meta">' + fmtTime(c.created_at) + (c.expires_at ? ' · Expires: ' + fmtTime(c.expires_at) : '') + '</div>';
+        if (c.proposal_text) {
+          html += '<div class="lc-summary" style="margin-top:6px">' + esc(c.proposal_text) + '</div>';
+        }
+        if (actions.length) {
+          html += '<div class="lc-steps" style="margin-top:8px">';
+          for (const a of actions) {
+            html += '<span class="lc-step" style="background:#dbeafe;color:#1e40af">' + esc(a) + '</span>';
+          }
+          html += '</div>';
+        }
+        if (categories.length) {
+          html += '<div class="lc-meta" style="margin-top:4px">Sectors: ' + esc(categories.join(", ")) + '</div>';
+        }
+        html += '</div>';
+      }
+      return html;
+    }
+
+    function renderScheduled(data) {
+      const sched = data.scheduled_actions || [];
+      const cond = data.conditional_orders || [];
+      if (!sched.length && !cond.length) return '<h2>Scheduled &amp; Conditional</h2><div class="empty">No scheduled actions or conditional orders in this run.</div>';
+      let html = '<h2>Scheduled &amp; Conditional</h2>';
+      if (sched.length) {
+        html += '<h3>Scheduled Actions</h3>';
+        html += '<table class="store"><thead><tr><th>ID</th><th>Intent / Ticker</th><th>Trigger</th><th>Value</th><th>Status</th></tr></thead><tbody>';
+        for (const a of sched) {
+          html += '<tr' + entityRow(a.entity_id) + '><td><code>' + esc(a.action_id) + '</code></td><td>' + esc(a.wrapped_intent_type) + ' / ' + esc(a.target_ticker || "-") + '</td><td>' + esc(a.trigger_type) + '</td><td>' + esc(a.trigger_value) + '</td><td>' + badge(a.status) + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      if (cond.length) {
+        html += '<h3>Conditional Orders</h3>';
+        html += '<table class="store"><thead><tr><th>Order ID</th><th>Ticker</th><th>Trigger / Price</th><th>Fraction</th><th>Status</th></tr></thead><tbody>';
+        for (const o of cond) {
+          html += '<tr' + entityRow(o.entity_id) + '><td><code>' + esc(o.order_id) + '</code></td><td>' + esc(o.ticker) + '</td><td>' + esc(o.trigger_type) + ' / ' + esc(o.trigger_price) + '</td><td>' + esc(o.trigger_fraction) + '</td><td>' + badge(o.status) + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      return html;
+    }
+
+    function renderConstraints(data) {
+      const items = data.constraints || [];
+      if (!items.length) return '<h2>Constraints</h2><div class="empty">No constraints set in this run.</div>';
+      let html = '<h2>Constraints</h2>';
+      html += '<p class="meta">Persistent rules the user has set. Active constraints block matching buys unless explicitly overridden for a single instruction.</p>';
+      html += '<table class="store"><thead><tr><th>ID</th><th>Type</th><th>Value</th><th>Status</th><th>Rationale</th></tr></thead><tbody>';
+      for (const c of items) {
+        html += '<tr' + entityRow(c.entity_id) + '><td><code>' + esc(c.constraint_id) + '</code></td><td>' + esc(c.type) + '</td><td>' + esc(c.value) + '</td><td>' + badge(c.active ? "active" : "inactive") + '</td><td>' + esc((c.rationale || "").slice(0, 160)) + '</td></tr>';
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function renderReplies(data) {
+      const items = data.agent_replies || [];
+      if (!items.length) return '<h2>Agent Replies</h2><div class="empty">No agent replies in this run.</div>';
+      let html = '<h2>Agent Replies</h2>';
+      html += '<p class="meta">Textual responses to information requests and advisories. Most recent first.</p>';
+      for (const r of items) {
+        html += '<div class="reply-card entity-row" data-entity-id="' + escAttr(r.entity_id) + '" onclick="openEntity(this.dataset.entityId)">';
+        html += '<div class="rc-meta">' + fmtTime(r.timestamp) + ' &middot; ' + badge(r.question_type || "general") + '</div>';
+        html += '<div class="rc-note">User note: ' + esc(r.note) + '</div>';
+        html += '<div class="rc-body">' + esc(r.reply) + '</div>';
+        html += '</div>';
+      }
+      return html;
+    }
+
+    function renderDiversification(data) {
+      const series = data.diversification_series || [];
+      if (!series.length) return '<h2>Diversification</h2><div class="empty">No portfolio snapshots with open positions yet.</div>';
+      let html = '<h2>Diversification</h2>';
+      html += '<p class="meta">Sector allocation over time. Uses the dynamic SectorClassifier so external buys are coloured correctly.</p>';
+      const latest = series[0];
+      html += '<h3>Latest snapshot</h3>';
+      html += '<div style="margin-bottom:18px">' + sectorBar(latest.breakdown) + '</div>';
+      html += '<h3>Recent history (last 15 cycles with positions)</h3>';
+      html += '<table class="store"><thead><tr><th>Timestamp</th><th>Action</th><th>Ticker</th><th>Sector breakdown</th></tr></thead><tbody>';
+      for (const item of series.slice(0, 15)) {
+        html += '<tr><td>' + fmtTime(item.timestamp) + '</td><td>' + esc(item.action) + '</td><td>' + esc(item.ticker) + '</td><td>' + sectorBar(item.breakdown) + '</td></tr>';
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function renderEvidence(data) {
+      const items = data.evidence || [];
+      if (!items.length) return '<h2>Evidence</h2><div class="empty">No external evidence collected in this run.</div>';
+      let html = '<h2>Evidence</h2>';
+      html += '<p class="meta">Every external source cited by the resolver, with the locations where it was used. Real URLs are clickable; LLM inferences are labelled.</p>';
+      html += '<table class="store"><thead><tr><th>Source ID</th><th>Title</th><th>Provider</th><th>Published</th><th>Cited in</th></tr></thead><tbody>';
+      for (const ev of items) {
+        const title = ev.clickable ? '<a href="' + esc(ev.url) + '" target="_blank" rel="noopener">' + esc(ev.title || ev.url) + '</a>' : (ev.is_inference ? '<span class="inference">[inference]</span> ' + esc(ev.title) : esc(ev.title));
+        const citedIn = (ev.cited_in || []).length + ' location(s)';
+        html += '<tr' + entityRow(ev.entity_id) + '><td><code>' + esc(ev.source_id) + '</code></td><td>' + title + '</td><td>' + esc(ev.provider) + (ev.publisher ? ' / ' + esc(ev.publisher) : '') + '</td><td>' + fmtTime(ev.published_at) + '</td><td>' + citedIn + '</td></tr>';
+      }
+      html += '</tbody></table>';
+      return html;
+    }
+
+    function renderAudit(data) {
+      let html = '<h2>Technical Audit</h2>';
+      html += '<p class="meta">Confidence, provider, schema, retries, limits, and diagnostics. Not shown in main tabs.</p>';
+      html += '<h3>Stats</h3>';
+      html += renderStatsCards(data.stats || {});
+      html += '<h3>Instruction Ledger</h3>';
+      const ledger = data.instruction_ledger || [];
+      if (!ledger.length) {
+        html += '<div class="empty">No instructions recorded.</div>';
+      } else {
+        html += '<table class="store"><thead><tr><th>Request</th><th>Intent</th><th>Ticker</th><th>Status</th><th>Updated / Retries</th></tr></thead><tbody>';
+        for (const e of ledger) {
+          html += '<tr' + entityRow(e.entity_id) + '><td><code>' + esc(e.request_id) + '</code></td><td>' + esc(e.intent_type) + '</td><td>' + esc(e.target_ticker || "-") + '</td><td>' + badge(e.status) + '</td><td>' + fmtTime(e.updated_at) + ' / ' + esc(e.retry_count) + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      html += '<h3>Recent Stages</h3>';
+      const stages = data.stages || [];
+      if (!stages.length) {
+        html += '<div class="empty">No stages recorded.</div>';
+      } else {
+        html += '<table class="store"><thead><tr><th>Timestamp</th><th>Stage</th><th>Status</th><th>Ticker</th><th>Message</th></tr></thead><tbody>';
+        for (const s of stages.slice(0, 50)) {
+          html += '<tr' + entityRow(s.entity_id) + '><td>' + fmtTime(s.timestamp) + '</td><td>' + esc(s.stage) + '</td><td>' + badge(s.status) + '</td><td>' + esc(s.ticker) + '</td><td>' + esc((s.message || "").slice(0, 200)) + '</td></tr>';
+        }
+        html += '</tbody></table>';
+      }
+      return html;
+    }
+
+    function renderStatsCards(stats) {
+      const labels = {
+        cycle_count: "Cycles", stage_count: "Stages", human_event_count: "Human events",
+        guardrails: "Guardrails", failures: "Failures", retries: "Retries", fallbacks: "Fallbacks",
+        tickers: "Tickers", first_timestamp: "First event", last_timestamp: "Last event",
+      };
+      let html = '<div class="summary">';
+      for (const [key, label] of Object.entries(labels)) {
+        let value = stats[key];
+        if (key.endsWith("timestamp")) value = fmtTime(value);
+        html += '<div class="stat-card ' + ((key === "failures" || key === "fallbacks") && value ? "warn" : "info") + '"><span>' + label + '</span><strong>' + esc(value) + '</strong></div>';
+      }
+      html += '</div>';
+      return html;
+    }
+
+    function applyData(data) {
+      const scrollY = window.scrollY;
+      const tableScrollPositions = saveScrollPositions();
+      DASHBOARD_DATA = data;
+      normalizeNewestFirst(data);
+      buildEntityIndex(data);
+      document.getElementById("run-meta").textContent = "Run: " + data.run_dir + " · Generated: " + fmtTime(data.generated_at);
+      document.getElementById("source-meta").textContent = "Projection: dashboard_data.js";
+      renderTab(activeTab);
+      updateNoveltyDots(data);
+      if (modalEntityId) renderEntityModal();
+      requestAnimationFrame(() => { window.scrollTo(0, scrollY); restoreScrollPositions(tableScrollPositions); });
+      const indicator = document.getElementById("refresh-indicator");
+      indicator.textContent = "Updated " + fmtTime(data.generated_at);
+      indicator.classList.remove("stale");
+    }
+
+    function loadProjection() {
+      const script = document.createElement("script");
+      script.src = "dashboard_data.js?t=" + Date.now();
+      script.onload = function () {
+        if (window.DASHBOARD_DATA) {
+          applyData(window.DASHBOARD_DATA);
+        }
+      };
+      script.onerror = function () {
+        const indicator = document.getElementById("refresh-indicator");
+        indicator.textContent = "Projection unavailable";
+        indicator.classList.add("stale");
+      };
+      document.body.appendChild(script);
+    }
+
+    loadProjection();
+    setInterval(loadProjection, 1000);
   </script>
 </body>
-</html>"""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(document, encoding="utf-8")
-    return output_path
-
-
-def _read_rows(journal_path: Path) -> list[dict[str, Any]]:
-    if not journal_path.exists():
-        return []
-    return [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-
-
-def _cycle_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [row for row in rows if row.get("entry_type", "cycle") == "cycle"]
-
-
-def _stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    cycle_rows = _cycle_rows(rows)
-    stage_rows = [row for row in rows if row.get("entry_type") == "stage"]
-    human_event_rows = [row for row in rows if row.get("entry_type") == "human_event"]
-    timeline_rows = cycle_rows or rows
-    actions = Counter(row.get("action", "UNKNOWN") for row in cycle_rows)
-    tickers = sorted({row.get("ticker", "-") for row in rows})
-    timestamps = [row.get("timestamp") for row in timeline_rows if row.get("timestamp")]
-    guardrails = sum(len(row.get("guardrails_triggered") or []) for row in cycle_rows)
-    failures = sum(len(row.get("failures") or []) for row in rows)
-    failures += sum(1 for row in stage_rows if row.get("status") == "failed")
-    retries = sum(_retry_count(row) for row in cycle_rows)
-    fallbacks = sum(1 for row in cycle_rows if row.get("llm_fallback_used"))
-    portfolio_outcome = _portfolio_outcome(cycle_rows)
-    portfolio_path = _portfolio_path(cycle_rows)
-    if timestamps:
-        run_summary = f"{len(cycle_rows)} cycles from {_format_datetime(min(timestamps))} to {_format_datetime(max(timestamps))}"
-        run_summary_short = f"{len(cycle_rows)} cycles"
-        run_summary_detail = f"{_format_datetime(min(timestamps))} to {_format_datetime(max(timestamps))}"
-    else:
-        run_summary = "No cycles recorded"
-        run_summary_short = "No cycles"
-        run_summary_detail = "-"
-    if not cycle_rows and stage_rows:
-        run_summary = f"No completed cycles; {len(stage_rows)} progress events recorded"
-        run_summary_short = "0 cycles"
-        run_summary_detail = f"{len(stage_rows)} progress events"
-    initial = _initial_portfolio(cycle_rows)
-    current = _current_portfolio(cycle_rows)
-    initial_cash = _safe_float((initial or {}).get("cash"))
-    current_cash = _safe_float((current or {}).get("cash"))
-    initial_value = _safe_float((initial or {}).get("portfolio_value"))
-    current_value = _safe_float((current or {}).get("portfolio_value"))
-    cash_delta = None if initial_cash is None or current_cash is None else current_cash - initial_cash
-    value_delta = None if initial_value is None or current_value is None else current_value - initial_value
-    return {
-        "actions": actions,
-        "cycle_count": len(cycle_rows),
-        "stage_count": len(stage_rows),
-        "human_event_count": len(human_event_rows),
-        "tickers": ", ".join(tickers) if tickers else "-",
-        "run_summary": run_summary,
-        "run_summary_short": run_summary_short,
-        "run_summary_detail": run_summary_detail,
-        "guardrails": guardrails,
-        "failures": failures,
-        "retries": retries,
-        "fallbacks": fallbacks,
-        "portfolio_outcome": portfolio_outcome,
-        "portfolio_path": portfolio_path,
-        "portfolio_path_short": _portfolio_path_short(initial_cash, current_cash, initial_value, current_value),
-        "portfolio_path_detail": _portfolio_path_detail(cash_delta, value_delta),
-        "portfolio_class": "warn" if value_delta is not None and value_delta < 0 else "good",
-        "recovery_class": "warn" if guardrails or fallbacks or retries else "good",
-        "health_class": "warn" if failures else "good",
-    }
-
-
-def _render_human_events(rows: list[dict[str, Any]]) -> str:
-    events = [row for row in rows if row.get("entry_type") == "human_event"]
-    if not events:
-        return ""
-    groups = _group_human_events(events)
-    items = "\n".join(_render_human_event_group(group, is_latest=index == len(groups[-8:]) - 1) for index, group in enumerate(groups[-8:]))
-    return f"""
-    <section class="human-panel" aria-label="Human message timeline">
-      <h2>Human message timeline</h2>
-      <div class="human-list">{items}</div>
-    </section>"""
-
-
-def _group_human_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    groups: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    for row in events:
-        key = str(row.get("note_id") or row.get("instruction_id") or row.get("timestamp") or len(order))
-        if key not in groups:
-            groups[key] = {"events": [], "details": {}, "tickers": [], "instruction_ids": []}
-            order.append(key)
-        group = groups[key]
-        group["events"].append(row)
-        ticker = str(row.get("ticker") or "")
-        if ticker and ticker != "HUMAN" and ticker not in group["tickers"]:
-            group["tickers"].append(ticker)
-        instruction_id = str(row.get("instruction_id") or "")
-        if instruction_id and instruction_id not in group["instruction_ids"]:
-            group["instruction_ids"].append(instruction_id)
-        details = row.get("details")
-        if isinstance(details, dict):
-            group["details"].update({key: value for key, value in details.items() if value is not None})
-    return [groups[key] for key in order]
-
-
-def _render_human_event_group(group: dict[str, Any], *, is_latest: bool) -> str:
-    events = group.get("events") or []
-    first = events[0] if events else {}
-    latest = events[-1] if events else {}
-    timestamp = _format_datetime(str(latest.get("timestamp", "-")))
-    note = str(first.get("note", "-"))
-    details = group.get("details") or {}
-    statuses = [str(row.get("status", "-")) for row in events]
-    status_summary = _human_status_summary(statuses)
-    summary_row = {
-        **latest,
-        "status": statuses[-1] if statuses else latest.get("status", "-"),
-        "ticker": ", ".join(group.get("tickers") or []) or latest.get("ticker", "HUMAN"),
-    }
-    instruction_id = ", ".join(group.get("instruction_ids") or []) or "-"
-    meta = _human_event_meta(summary_row, details)
-    detail_lines = _human_event_detail_lines(details)
-    open_attr = " open" if is_latest else ""
-    return f"""
-      <details class="human-card"{open_attr}>
-        <summary>
-          <span class="human-summary-main">{_e(note)}</span>
-          <span class="human-summary-sub">{_e(status_summary)} | {_e(timestamp)} | instruction {_e(instruction_id)}</span>
-        </summary>
-        <div class="human-card-body">
-          <div class="human-meta">{meta}</div>
-          <div class="human-steps">{_human_status_steps(statuses)}</div>
-          {detail_lines}
-        </div>
-      </details>"""
-
-
-def _human_status_summary(statuses: list[str]) -> str:
-    cleaned = [status for status in statuses if status and status != "-"]
-    if not cleaned:
-        return "No status"
-    if len(cleaned) == 1:
-        return f"Latest {cleaned[-1]}"
-    return f"{len(cleaned)} updates; latest {cleaned[-1]}"
-
-
-def _human_status_steps(statuses: list[str]) -> str:
-    cleaned = [s for s in statuses if s]
-    if not cleaned:
-        return ""
-    if len(cleaned) == 1:
-        return f'<span class="human-step-chip">{_e(cleaned[0])}</span>'
-    return f'<span class="human-step-chip">{_e(cleaned[0])}</span>' f'<span class="human-step-chip">···</span>' f'<span class="human-step-chip">{_e(cleaned[-1])}</span>'
-
-
-def _human_event_meta(row: dict[str, Any], details: Any) -> str:
-    detail = details if isinstance(details, dict) else {}
-    chips = [f'<span class="human-chip status">{_e(row.get("status", "-"))}</span>']
-    if detail.get("intent_type"):
-        chips.append(f'<span class="human-chip intent">{_e(detail.get("intent_type"))}</span>')
-    ticker = str(row.get("ticker") or "")
-    if ticker and ticker != "HUMAN":
-        chips.append(f'<span class="human-chip target">target {_e(ticker)}</span>')
-    if detail.get("confidence") is not None:
-        chips.append(f'<span class="human-chip">confidence {_e(_format_confidence(detail.get("confidence")))}</span>')
-    if detail.get("topic"):
-        chips.append(f'<span class="human-chip">topic {_e(detail.get("topic"))}</span>')
-    if detail.get("reason"):
-        chips.append(f'<span class="human-chip">{_e(detail.get("reason"))}</span>')
-    return "".join(chips)
-
-
-def _human_event_detail_lines(details: Any) -> str:
-    detail = details if isinstance(details, dict) else {}
-    lines: list[str] = []
-    rationale = detail.get("rationale")
-    if rationale:
-        lines.append(_human_detail("Rationale", str(rationale)))
-    risk_profile = detail.get("human_risk_profile")
-    if isinstance(risk_profile, dict):
-        lines.append(
-            _human_detail(
-                "Risk profile",
-                (
-                    f"{risk_profile.get('risk_preference', 'neutral')}; "
-                    f"buy {_format_confidence(risk_profile.get('buy_aggressiveness'))}; "
-                    f"sell {_format_confidence(risk_profile.get('sell_aggressiveness'))}; "
-                    f"{risk_profile.get('rationale', '')}"
-                ).strip(),
-            )
-        )
-    risk_limits = detail.get("risk_limits")
-    if isinstance(risk_limits, dict):
-        lines.append(
-            _human_detail(
-                "Risk limits",
-                f"max buy {risk_limits.get('max_buy_quantity', '-')}; max sell {risk_limits.get('max_sell_quantity', '-')}",
-            )
-        )
-    planned = detail.get("planned_targets")
-    if isinstance(planned, list) and planned:
-        if _has_human_target_rationale(planned):
-            lines.append(_human_target_rationale_detail("Target rationale", planned))
-        else:
-            lines.append(_human_detail("Planned positions", _format_human_target_list(planned)))
-    excluded = detail.get("excluded_tickers")
-    if isinstance(excluded, list) and excluded:
-        if _has_human_target_rationale(excluded):
-            lines.append(_human_target_rationale_detail("Excluded rationale", excluded))
-        else:
-            lines.append(_human_detail("Excluded positions", _format_human_target_list(excluded)))
-    buyable = detail.get("buyable_universe")
-    if buyable:
-        lines.append(_human_detail("Buy universe", ", ".join(str(item) for item in buyable)))
-    sellable = detail.get("sellable_open_positions")
-    if sellable:
-        lines.append(_human_detail("Sellable positions", ", ".join(str(item) for item in sellable)))
-    return "".join(lines)
-
-
-def _human_detail(label: str, value: str) -> str:
-    return f'<div class="human-detail"><span>{_e(label)}:</span>{_e(value)}</div>'
-
-
-def _human_target_rationale_detail(label: str, items: list[Any]) -> str:
-    rows: list[str] = []
-    rationales = [str(item.get("rationale") or "").strip() for item in items if isinstance(item, dict)]
-    all_same = len(set(rationales)) == 1 and rationales[0]
-
-    for item in items:
-        if not isinstance(item, dict):
-            rows.append(f'<div class="human-target-row"><b>{_e(str(item))}</b><div>-</div></div>')
-            continue
-        ticker = str(item.get("ticker") or "-").upper()
-        seq_i = item.get("sequence_index")
-        seq_t = item.get("sequence_total")
-        seq = f" {seq_i}/{seq_t}" if seq_i and seq_t else ""
-        rationale = str(item.get("rationale") or "").strip() or "-"
-        display = "-" if all_same else rationale
-        rows.append(f'<div class="human-target-row"><b>{_e(ticker + seq)}</b><div>{_e(display)}</div></div>')
-
-    common = f'<div class="human-detail"><span>Common rationale:</span>{_e(rationales[0])}</div>' if all_same else ""
-    return f'<div class="human-detail"><span>{_e(label)}:</span>' f'<div class="human-target-list">{"".join(rows)}</div></div>' + common
-
-
-def _has_human_target_rationale(items: list[Any]) -> bool:
-    return any(isinstance(item, dict) and str(item.get("rationale") or "").strip() for item in items)
-
-
-def _format_human_target_list(items: list[Any]) -> str:
-    parts: list[str] = []
-    for item in items:
-        if isinstance(item, dict):
-            ticker = str(item.get("ticker") or item.get("symbol") or "-").upper()
-            sequence_index = item.get("sequence_index")
-            sequence_total = item.get("sequence_total")
-            sequence = f" {sequence_index}/{sequence_total}" if sequence_index and sequence_total else ""
-            rationale = str(item.get("rationale") or "").strip()
-            parts.append(f"{ticker}{sequence}: {rationale}" if rationale else f"{ticker}{sequence}")
-        else:
-            parts.append(str(item))
-    return "; ".join(parts)
-
-
-def _format_confidence(value: Any) -> str:
-    try:
-        return f"{float(value):.2f}"
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _render_row(index: int, row: dict[str, Any]) -> str:
-    action = row.get("action", "-")
-    ticker = row.get("ticker", "-")
-    signals = _signals_html(row)
-    portfolio = _portfolio_delta_html(row)
-    after_positions = (_portfolio_after(row) or {}).get("positions")
-    breakdown = _sector_breakdown(after_positions)
-    diversification_html = _sector_bar_html(breakdown)
-    outcome = _outcome_text(row)
-    outcome_badge = _outcome_badge_html(row)
-    timestamp = str(row.get("timestamp", "-"))
-    filter_kind = _row_filter_kind(row)
-    has_guardrails = "1" if row.get("guardrails_triggered") else "0"
-    return f"""
-        <tr class="journal-row" tabindex="0" onclick="showDetails({index})" onkeydown="handleRowKey(event, {index})" data-ticker="{_e(ticker)}" data-kind="{filter_kind}" data-guardrails="{has_guardrails}" title="Open details">
-          <td data-label="Timestamp" data-raw-timestamp="{_e(timestamp)}">{_timestamp_html(timestamp)}</td>
-          <td data-label="Action"><span class="badge {_e(action)}">{_e(action)} {_e(ticker)}</span></td>
-          <td data-label="Summary"><div class="cell-clamp summary-cell">{_e(row.get("cycle_summary", "-"))}</div><div class="summary-signals">{signals}</div></td>
-          <td data-label="Cash movement">{portfolio}</td>
-          <td data-label="Diversification">{diversification_html}</td>
-          <td data-label="Outcome">{outcome_badge}</td>
-        </tr>"""
-
-
-def _details_payload(row: dict[str, Any]) -> dict[str, str]:
-    return {
-        "timestamp": str(row.get("timestamp", "-")),
-        "ticker": str(row.get("ticker", "-")),
-        "action": str(row.get("action", "-")),
-        "draft_short": _draft_short(row),
-        "confidence": f"{float(row.get('confidence', 0)):.2f}",
-        "quantity_short": _quantity_short(row),
-        "portfolio_short": _portfolio_short(row),
-        "order_price_short": _order_price_short(row),
-        "fill_price_short": _fill_price_short(row),
-        "outcome_short": _outcome_short(row),
-        "llm_short": _llm_short(row),
-        "data_short": _data_readiness(row),
-        "alert_html": _alert_html(row),
-        "cycle_summary": str(row.get("cycle_summary", "-")),
-        "rationale": str(row.get("rationale", "-")),
-        "rationale_markdown": _rationale_markdown(row),
-        "decision_audit_markdown": _decision_audit_markdown(row),
-        "technical_markdown": _technical_markdown(row),
-        "guardrails_markdown": _markdown_list(row.get("guardrails_triggered") or [], "No guardrails triggered."),
-        "failures_markdown": _markdown_list(row.get("failures") or [], "No failures recorded."),
-        "llm_markdown": _llm_markdown(row),
-        "portfolio_markdown": _portfolio_markdown(row),
-        "diversification_text": _diversification_text(_portfolio_after(row)),
-        "outcome": _outcome_text(row),
-        "structured_details": json.dumps(_format_dashboard_value(row), indent=2, ensure_ascii=False),
-    }
-
-
-def _quantity_short(row: dict[str, Any]) -> str:
-    decision = row.get("decision") or {}
-    execution = row.get("execution_result") or {}
-    requested = execution.get("requested_quantity", decision.get("quantity"))
-    allowed = execution.get("allowed_quantity")
-    if allowed is None:
-        return f"requested {requested}"
-    return f"requested {requested}, max {allowed}"
-
-
-def _order_price_short(row: dict[str, Any]) -> str:
-    execution = row.get("execution_result") or {}
-    return _format_money(_safe_float(execution.get("current_price_at_order")))
-
-
-def _fill_price_short(row: dict[str, Any]) -> str:
-    execution = row.get("execution_result") or {}
-    return _format_money(_safe_float(execution.get("filled_avg_price")))
-
-
-def _draft_short(row: dict[str, Any]) -> str:
-    draft = row.get("draft_decision") or {}
-    if not draft:
-        return "same as final"
-    return f"{draft.get('action', '-')} qty {draft.get('quantity', '-')}"
-
-
-def _decision_audit_markdown(row: dict[str, Any]) -> str:
-    decision = row.get("decision") or {}
-    draft = row.get("draft_decision") or {}
-    execution = row.get("execution_result") or {}
-    lines = [
-        f"- draft_action: {draft.get('action', 'n/a')}",
-        f"- draft_quantity: {draft.get('quantity', 'n/a')}",
-        f"- draft_confidence: {_format_dashboard_value(draft.get('confidence', 'n/a'))}",
-        f"- llm_action: {decision.get('action', row.get('action', '-'))}",
-        f"- llm_quantity: {decision.get('quantity', '-')}",
-        f"- llm_confidence: {_format_dashboard_value(decision.get('confidence', row.get('confidence', '-')))}",
-        f"- executor_attempted_action: {execution.get('attempted_action', '-')}",
-        f"- requested_quantity: {execution.get('requested_quantity', decision.get('quantity', '-'))}",
-        f"- allowed_quantity: {execution.get('allowed_quantity', 'n/a')}",
-        f"- current_price_at_order: {_format_money(_safe_float(execution.get('current_price_at_order')))}",
-        f"- filled_avg_price: {_format_money(_safe_float(execution.get('filled_avg_price')))}",
-        f"- execution_status: {execution.get('status', row.get('outcome', '-'))}",
-    ]
-    if execution.get("message"):
-        lines.append(f"- execution_message: {execution.get('message')}")
-    if execution.get("risk_explanation"):
-        lines.append(f"- risk_explanation: {execution.get('risk_explanation')}")
-    return "\n".join(lines)
-
-
-def _rationale_markdown(row: dict[str, Any]) -> str:
-    decision = row.get("decision") or {}
-    details = decision.get("rationale_details") or {}
-    if not isinstance(details, dict) or not details:
-        return "No structured rationale details recorded."
-    lines: list[str] = []
-    if details.get("summary"):
-        lines.append(f"- summary: {details.get('summary')}")
-    for item in details.get("evidence") or []:
-        lines.append(f"- evidence: {item}")
-    for item in details.get("risks") or []:
-        lines.append(f"- risk: {item}")
-    if details.get("data_quality"):
-        lines.append(f"- data_quality: {details.get('data_quality')}")
-    return "\n".join(lines) if lines else "No structured rationale details recorded."
-
-
-def _technical_markdown(row: dict[str, Any]) -> str:
-    snapshot = row.get("market_snapshot") or {}
-    indicators = snapshot.get("technical_indicators") or {}
-    lines = [
-        f"- confidence: {indicators.get('confidence', 'none')}",
-        f"- summary: {_technical_summary(indicators)}",
-    ]
-    for key in ["sma_20", "sma_50", "rsi_14", "macd", "macd_signal", "macd_histogram"]:
-        if indicators.get(key) is not None:
-            lines.append(f"- {key}: {_format_dashboard_value(indicators.get(key))}")
-    for note in indicators.get("notes") or []:
-        lines.append(f"- note: {note}")
-    return "\n".join(lines)
-
-
-def _technical_summary(indicators: dict[str, Any]) -> str:
-    parts: list[str] = []
-    rsi = indicators.get("rsi_14")
-    if isinstance(rsi, (int, float)):
-        if rsi >= 70:
-            parts.append("RSI overbought")
-        elif rsi <= 30:
-            parts.append("RSI oversold")
-        else:
-            parts.append("RSI neutral")
-    macd = indicators.get("macd")
-    signal = indicators.get("macd_signal")
-    if isinstance(macd, (int, float)) and isinstance(signal, (int, float)):
-        parts.append("MACD bullish" if macd > signal else "MACD bearish")
-    sma_20 = indicators.get("sma_20")
-    sma_50 = indicators.get("sma_50")
-    if isinstance(sma_20, (int, float)) and isinstance(sma_50, (int, float)):
-        parts.append("SMA20 above SMA50" if sma_20 > sma_50 else "SMA20 below SMA50")
-    return "; ".join(parts) if parts else "No technical signal"
-
-
-def _format_dashboard_value(value: Any) -> Any:
-    if isinstance(value, bool) or value is None:
-        return value
-    if isinstance(value, float):
-        return f"{value:.2f}"
-    if isinstance(value, dict):
-        return {key: _format_dashboard_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_format_dashboard_value(item) for item in value]
-    return value
-
-
-def _data_quality_pill(row: dict[str, Any]) -> str:
-    snapshot = row.get("market_snapshot") or {}
-    values = [
-        snapshot.get("price_confidence", "none"),
-        snapshot.get("news_confidence", "none"),
-        (snapshot.get("technical_indicators") or {}).get("confidence", "none"),
-    ]
-    if "low" in values or "none" in values:
-        return '<span class="signal-pill warn">Data quality: partial</span>'
-    return '<span class="signal-pill good">Data quality: good</span>'
-
-
-def _technical_pill(row: dict[str, Any]) -> str:
-    indicators = (row.get("market_snapshot") or {}).get("technical_indicators") or {}
-    confidence = indicators.get("confidence", "none")
-    if confidence in {"high", "medium"}:
-        return '<span class="signal-pill good">Technicals: ready</span>'
-    return '<span class="signal-pill muted">Technicals: limited</span>'
-
-
-def _llm_pill(row: dict[str, Any]) -> str:
-    provider = row.get("llm_provider") or "none"
-    if row.get("llm_fallback_used"):
-        return f'<span class="signal-pill warn">AI: fallback {_e(provider)}</span>'
-    return f'<span class="signal-pill muted">AI: {_e(provider)}</span>'
-
-
-def _llm_markdown(row: dict[str, Any]) -> str:
-    lines = [f"- provider: {row.get('llm_provider') or 'none'}"]
-    lines.append(f"- fallback_used: {bool(row.get('llm_fallback_used'))}")
-    if row.get("llm_fallback_provider"):
-        lines.append(f"- fallback_provider: {row.get('llm_fallback_provider')}")
-    if row.get("llm_fallback_reason"):
-        lines.append(f"- fallback_reason: {row.get('llm_fallback_reason')}")
-    return "\n".join(lines)
-
-
-def _signals_html(row: dict[str, Any]) -> str:
-    pieces = [
-        _data_quality_pill(row),
-        _technical_pill(row),
-        _llm_pill(row),
-    ]
-    if row.get("guardrails_triggered"):
-        pieces.append('<span class="signal-pill warn">Guardrail</span>')
-    if row.get("cancelled_by"):
-        pieces.append(f'<span class="signal-pill cancelled" title="Cancelled by instruction {row["cancelled_by"]}">CANCELLATO</span>')
-    retry_count = int(row.get("retry_count") or 0)
-    if retry_count > 0:
-        pieces.append(f'<span class="signal-pill retry" title="Retry attempt {retry_count}">RETRY {retry_count}</span>')
-    failure_type = row.get("failure_type")
-    if failure_type:
-        pieces.append(f'<span class="signal-pill failed" title="Classified failure type">{failure_type}</span>')
-    reversal_of = row.get("reversal_of")
-    if reversal_of:
-        pieces.append(f'<span class="signal-pill reversal" title="Reversal of instruction {reversal_of}">REVERSAL</span>')
-    return '<div class="signal-stack">' + "".join(pieces) + "</div>"
-
-
-def _outcome_badge_html(row: dict[str, Any]) -> str:
-    if row.get("cancelled_by"):
-        return '<span class="outcome-badge cancelled">Cancelled</span>'
-    execution = row.get("execution_result") or {}
-    status = str(execution.get("status", row.get("outcome", ""))).lower()
-    if status in {"filled", "skipped"}:
-        return '<span class="outcome-badge success">Success</span>'
-    if status == "waiting":
-        return '<span class="outcome-badge neutral">Waiting</span>'
-    if status == "submitted":
-        return '<span class="outcome-badge neutral">Submitted</span>'
-    if status in {"blocked", "rejected", "failed"}:
-        return '<span class="outcome-badge failed">Failed</span>'
-    return '<span class="outcome-badge neutral">Pending</span>'
-
-
-def _outcome_short(row: dict[str, Any]) -> str:
-    execution = row.get("execution_result") or {}
-    status = execution.get("status", row.get("outcome", "-"))
-    return str(status)
-
-
-def _llm_short(row: dict[str, Any]) -> str:
-    provider = row.get("llm_provider") or "none"
-    if row.get("llm_fallback_used"):
-        return f"{provider} fallback"
-    return str(provider)
-
-
-def _portfolio_short(row: dict[str, Any]) -> str:
-    before = _portfolio_before(row)
-    after = _portfolio_after(row)
-    cash = _safe_float((after or {}).get("cash"))
-    cash_before = _safe_float((before or {}).get("cash"))
-    delta = None if cash is None or cash_before is None else cash - cash_before
-    value = _safe_float((after or {}).get("portfolio_value"))
-    value_before = _safe_float((before or {}).get("portfolio_value"))
-    value_delta = None if value is None or value_before is None else value - value_before
-    positions = _positions_count((after or {}).get("positions"))
-    if value is not None:
-        return f"value {_format_money(value)} ({_format_signed_money(value_delta)}), cash {_format_money(cash)}, {positions} positions"
-    return f"cash {_format_money(cash)} ({_format_signed_money(delta)}), {positions} positions"
-
-
-def _alert_html(row: dict[str, Any]) -> str:
-    guardrails = row.get("guardrails_triggered") or []
-    failures = row.get("failures") or []
-    if not guardrails and not failures:
-        return ""
-    parts = []
-    if guardrails:
-        parts.append(f"{len(guardrails)} guardrail(s)")
-    if failures:
-        parts.append(f"{len(failures)} failure(s)")
-    return f'<div class="alert-panel">Attention: {_e(", ".join(parts))}</div>'
-
-
-def _row_filter_kind(row: dict[str, Any]) -> str:
-    action = row.get("action")
-    execution = row.get("execution_result") or {}
-    status = str(execution.get("status", row.get("outcome", ""))).lower()
-    if status in {"blocked", "rejected", "failed"}:
-        return "failed"
-    if action in {"BUY", "SELL"}:
-        return "trades"
-    return "other"
-
-
-def _portfolio_outcome(rows: list[dict[str, Any]]) -> str:
-    for row in reversed(rows):
-        portfolio = _portfolio_after(row)
-        if portfolio:
-            cash = _safe_float(portfolio.get("cash"))
-            value = _safe_float(portfolio.get("portfolio_value"))
-            positions = _positions_count(portfolio.get("positions"))
-            if value is not None:
-                return f"value {_format_money(value)}, cash {_format_money(cash)}, {positions} open positions"
-            cash_text = f"cash {_format_money(cash)}" if cash is not None else "cash unknown"
-            return f"{cash_text}, {positions} open positions"
-    return "No portfolio snapshot"
-
-
-def _portfolio_path(rows: list[dict[str, Any]]) -> str:
-    initial = _initial_portfolio(rows)
-    current = _current_portfolio(rows)
-    if not initial and not current:
-        return "No portfolio path"
-    initial_cash = _safe_float((initial or {}).get("cash"))
-    current_cash = _safe_float((current or {}).get("cash"))
-    initial_value = _safe_float((initial or {}).get("portfolio_value"))
-    current_value = _safe_float((current or {}).get("portfolio_value"))
-    if initial_value is not None or current_value is not None:
-        delta = None if initial_value is None or current_value is None else current_value - initial_value
-        return f"Initial value {_format_money(initial_value)} to Current value {_format_money(current_value)} ({_format_signed_money(delta)})"
-    delta = None if initial_cash is None or current_cash is None else current_cash - initial_cash
-    return f"Initial cash {_format_money(initial_cash)} to Current cash {_format_money(current_cash)} ({_format_signed_money(delta)})"
-
-
-def _portfolio_path_short(
-    initial_cash: float | None,
-    current_cash: float | None,
-    initial_value: float | None,
-    current_value: float | None,
-) -> str:
-    if initial_value is not None or current_value is not None:
-        return f"{_format_money(initial_value)} to {_format_money(current_value)}"
-    return f"{_format_money(initial_cash)} to {_format_money(current_cash)}"
-
-
-def _portfolio_path_detail(cash_delta: float | None, value_delta: float | None) -> str:
-    if value_delta is not None:
-        return f"Portfolio value movement {_format_signed_money(value_delta)}, Cash movement {_format_signed_money(cash_delta)}"
-    return f"Cash movement {_format_signed_money(cash_delta)}"
-
-
-def _portfolio_delta_html(row: dict[str, Any]) -> str:
-    before = _portfolio_before(row)
-    after = _portfolio_after(row)
-    if not before and not after:
-        return '<span class="muted">No snapshot</span>'
-    cash = _safe_float((after or {}).get("cash"))
-    cash_before = _safe_float((before or {}).get("cash"))
-    delta = None if cash is None or cash_before is None else cash - cash_before
-    delta_class = " negative" if delta is not None and delta < 0 else ""
-    delta_label = _cash_movement_label(row, delta)
-    positions = _positions_count((after or {}).get("positions"))
-    value = _safe_float((after or {}).get("portfolio_value"))
-    value_line = f"Portfolio {_e(_format_money(value))}<br>" if value is not None else ""
-    return (
-        '<div class="portfolio-mini">'
-        f'<span class="portfolio-delta{delta_class} money">{_e(delta_label)}</span>'
-        f'<div class="portfolio-pos">{value_line}Cash {_e(_format_money(cash))}, Pos {positions}</div>'
-        "</div>"
-    )
-
-
-def _cash_movement_label(row: dict[str, Any], delta: float | None) -> str:
-    if delta is None:
-        return "n/a"
-    action = row.get("action")
-    if action == "BUY" and delta < 0:
-        return f"Spent {_format_money(abs(delta))}"
-    if action == "SELL" and delta > 0:
-        return f"Received {_format_money(delta)}"
-    if delta == 0:
-        return "No cash change"
-    return _format_signed_money(delta)
-
-
-def _portfolio_markdown(row: dict[str, Any]) -> str:
-    portfolio = _portfolio_after(row)
-    before = _portfolio_before(row)
-    if not portfolio:
-        return "No portfolio snapshot recorded."
-    cash = _safe_float(portfolio.get("cash"))
-    cash_before = _safe_float((before or {}).get("cash"))
-    delta = None if cash is None or cash_before is None else cash - cash_before
-    value = _safe_float(portfolio.get("portfolio_value"))
-    value_before = _safe_float((before or {}).get("portfolio_value"))
-    value_delta = None if value is None or value_before is None else value - value_before
-    positions = portfolio.get("positions")
-    lines = [
-        f"- initial_cash: {_format_money(cash_before) if cash_before is not None else 'unknown'}",
-        f"- cash_after: {_format_money(cash) if cash is not None else 'unknown'}",
-        f"- cash_delta: {_format_signed_money(delta) if delta is not None else 'unknown'}",
-        f"- initial_portfolio_value: {_format_money(value_before) if value_before is not None else 'unknown'}",
-        f"- portfolio_value_after: {_format_money(value) if value is not None else 'unknown'}",
-        f"- portfolio_value_delta: {_format_signed_money(value_delta) if value_delta is not None else 'unknown'}",
-    ]
-    normalized = normalize_positions(positions)
-    if not normalized:
-        lines.append("- positions: none")
-    else:
-        lines.append(f"- positions: {len(normalized)}")
-        for symbol, payload in normalized.items():
-            qty = _safe_float(payload.get("qty"))
-            market_value = _safe_float(payload.get("market_value"))
-            qty_text = f"{qty:.2f}" if qty is not None else "unknown"
-            value_text = _format_money(market_value) if market_value is not None else "unknown"
-            lines.append(f"- {symbol}: qty {qty_text}, market_value {value_text}")
-    return "\n".join(lines)
-
-
-def _portfolio_after(row: dict[str, Any]) -> dict[str, Any] | None:
-    execution = row.get("execution_result") or {}
-    portfolio = execution.get("portfolio_after")
-    return portfolio if isinstance(portfolio, dict) else None
-
-
-def _portfolio_before(row: dict[str, Any]) -> dict[str, Any] | None:
-    execution = row.get("execution_result") or {}
-    portfolio = execution.get("portfolio_before")
-    return portfolio if isinstance(portfolio, dict) else None
-
-
-def _initial_portfolio(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for row in rows:
-        portfolio = _portfolio_before(row) or _portfolio_after(row)
-        if portfolio:
-            return portfolio
-    return None
-
-
-def _current_portfolio(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
-    for row in reversed(rows):
-        portfolio = _portfolio_after(row) or _portfolio_before(row)
-        if portfolio:
-            return portfolio
-    return None
-
-
-def _positions_count(positions: Any) -> int:
-    return len(normalize_positions(positions))
-
-
-def _safe_float(value: Any) -> float | None:
-    return float_or_none(value)
-
-
-def _format_money(value: float | None) -> str:
-    if value is None:
-        return "unknown"
-    return f"${value:,.2f}"
-
-
-def _format_signed_money(value: float | None) -> str:
-    if value is None:
-        return "unknown"
-    sign = "+" if value >= 0 else "-"
-    return f"{sign}${abs(value):,.2f}"
-
-
-def _data_readiness(row: dict[str, Any]) -> str:
-    snapshot = row.get("market_snapshot") or {}
-    price = snapshot.get("price_confidence", "none")
-    news = snapshot.get("news_confidence", "none")
-    technical = (snapshot.get("technical_indicators") or {}).get("confidence", "none")
-    if price in {"high", "medium"} and news in {"high", "medium"} and technical in {"high", "medium"}:
-        return "Market data ready, news available, technical signals ready"
-    missing = []
-    if price in {"low", "none"}:
-        missing.append("market price")
-    if news in {"low", "none"}:
-        missing.append("news")
-    if technical in {"low", "none"}:
-        missing.append("technical signals")
-    return "Partial data: " + ", ".join(missing)
-
-
-def _outcome_text(row: dict[str, Any]) -> str:
-    execution = row.get("execution_result") or {}
-    if execution:
-        status = execution.get("status", row.get("outcome", "-"))
-        message = execution.get("message", "")
-        return f"{status}: {message}".strip()
-    return str(row.get("outcome", "-"))
-
-
-def _retry_count(row: dict[str, Any]) -> int:
-    snapshot = row.get("market_snapshot") or {}
-    execution = row.get("execution_result") or {}
-    return int(snapshot.get("retry_count") or 0) + int(execution.get("retry_count") or 0)
-
-
-def _markdown_list(items: list[Any], empty: str) -> str:
-    if not items:
-        return empty
-    return "\n".join(f"- {item}" for item in items)
-
-
-def _empty_row() -> str:
-    return '<tr><td colspan="6" class="muted">No entries yet.</td></tr>'
-
-
-def _timestamp_html(value: str) -> str:
-    parsed = _parse_datetime(value)
-    if not parsed:
-        return _e(value)
-    return f'<div class="time-main">{parsed.strftime("%d/%m %H:%M:%S")}</div>' f'<div class="time-sub">{parsed.strftime("%Y")} UTC</div>'
-
-
-def _format_datetime(value: str) -> str:
-    parsed = _parse_datetime(value)
-    if not parsed:
-        return value
-    return parsed.strftime("%d/%m/%Y %H:%M:%S")
-
-
-def _parse_datetime(value: str) -> datetime | None:
-    try:
-        normalized = value.replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(normalized)
-    except ValueError:
-        return None
-    if parsed.tzinfo is not None:
-        return parsed.astimezone().replace(tzinfo=None)
-    return parsed
-
-
-def _sector_breakdown(positions: Any) -> dict[str, float]:
-    try:
-        from trading_agent.core.rebalance import TICKER_SECTOR
-    except ImportError:
-        return {}
-    normalized = normalize_positions(positions)
-    totals: dict[str, float] = {}
-    for symbol, data in normalized.items():
-        sector = TICKER_SECTOR.get(symbol.upper(), "other")
-        mv = _safe_float(data.get("market_value")) or 0.0
-        totals[sector] = totals.get(sector, 0) + mv
-    total = sum(totals.values())
-    if total <= 0:
-        return {}
-    return {s: round(v / total * 100, 1) for s, v in sorted(totals.items())}
-
-
-def _sector_bar_html(breakdown: dict[str, float]) -> str:
-    if not breakdown:
-        return '<span class="muted">—</span>'
-    COLORS = {
-        "technology": "#1769aa",
-        "automotive": "#147d4f",
-        "manufacturing": "#b54708",
-        "energy": "#b42318",
-        "healthcare": "#5b21b6",
-        "finance": "#0e7490",
-        "consumer": "#92400e",
-        "other": "#667085",
-    }
-    bars = "".join(f'<div style="height:100%;width:{pct}%;background:{COLORS.get(sector,"#667085")}" ' f'title="{sector} {pct}%"></div>' for sector, pct in breakdown.items())
-    labels = " ".join(f'<span style="font-size:11px;color:{COLORS.get(s,"#667085")}">' f"{s[:4]} {p}%</span>" for s, p in breakdown.items())
-    return (
-        f'<div style="display:flex;height:6px;border-radius:999px;overflow:hidden;'
-        f'background:#eef1f5;margin-bottom:3px">{bars}</div>'
-        f'<div style="display:flex;flex-wrap:wrap;gap:4px">{labels}</div>'
-    )
-
-
-def _diversification_text(portfolio: dict | None) -> str:
-    if not portfolio:
-        return "No portfolio snapshot."
-    breakdown = _sector_breakdown(portfolio.get("positions"))
-    if not breakdown:
-        return "No open positions."
-    return "\n".join(f"- {sector}: {pct}%" for sector, pct in breakdown.items())
-
-
-def _e(value: Any) -> str:
-    return html.escape(str(value))
+</html>
+"""

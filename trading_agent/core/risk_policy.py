@@ -13,6 +13,21 @@ from trading_agent.core.portfolio import portfolio_value as portfolio_total_valu
 from trading_agent.core.portfolio import positions as portfolio_positions
 
 
+def normalize_requested_quantity(quantity: Any) -> tuple[int | None, str | None]:
+    try:
+        value = float(quantity)
+    except (TypeError, ValueError):
+        return None, f"Invalid quantity: {quantity!r}"
+    if value != value:
+        return None, "Invalid quantity: NaN"
+    if value <= 0:
+        return None, f"Non-positive quantity not supported: {value}"
+    floored = int(floor(value))
+    if floored < 1 or floored != value:
+        return None, f"Fractional share request {value} requires confirmation before rounding."
+    return floored, None
+
+
 @dataclass(frozen=True)
 class RiskPolicy:
     max_quantity_absolute: int = 10
@@ -82,6 +97,24 @@ class RiskPolicy:
         remaining_position_notional = max(0.0, max_position_notional - current_market_value)
         return min(base_quantity, max(0, floor(remaining_position_notional / estimated_price)))
 
+    def max_explicit_notional_buy_quantity(
+        self,
+        *,
+        cash: float | None,
+        estimated_price: float | None,
+        portfolio_value: float | None,
+        current_market_value: float,
+    ) -> int:
+        limits = [self.max_quantity_absolute]
+        if estimated_price is None or estimated_price <= 0:
+            return max(0, min(limits))
+        if cash is not None:
+            limits.append(max(0, floor(cash / estimated_price)))
+        if portfolio_value is not None and portfolio_value > 0:
+            remaining = max(0.0, portfolio_value * self.portfolio_risk_fraction - current_market_value)
+            limits.append(max(0, floor(remaining / estimated_price)))
+        return max(0, min(limits))
+
     def max_sell_quantity(self, *, current_quantity: float) -> int:
         return max(0, min(self.max_quantity_absolute, floor(max(0.0, current_quantity))))
 
@@ -136,7 +169,6 @@ def build_position_sizing_context(
     risk_policy: RiskPolicy | None = None,
     human_risk_profile: HumanRiskProfile | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Expose deterministic risk limits to the Analyst prompt."""
     risk_policy = risk_policy or RiskPolicy.from_env()
     risk_profile = _coerce_human_risk_profile(human_risk_profile)
     effective_policy = risk_policy.adjusted_for_human_profile(risk_profile)
@@ -147,6 +179,12 @@ def build_position_sizing_context(
     current_qty = current_position.get("qty", 0.0)
     current_market_value = current_position.get("market_value", 0.0)
     max_buy_quantity = effective_policy.max_buy_quantity(
+        cash=cash,
+        estimated_price=snapshot.price,
+        portfolio_value=portfolio_value,
+        current_market_value=current_market_value,
+    )
+    max_explicit_notional_buy_quantity = effective_policy.max_explicit_notional_buy_quantity(
         cash=cash,
         estimated_price=snapshot.price,
         portfolio_value=portfolio_value,
@@ -168,6 +206,7 @@ def build_position_sizing_context(
         "estimated_price": snapshot.price,
         "max_quantity": max(max_buy_quantity, max_sell_quantity),
         "max_buy_quantity": max_buy_quantity,
+        "max_explicit_notional_buy_quantity": max_explicit_notional_buy_quantity,
         "max_sell_quantity": max_sell_quantity,
         "take_profit_triggered": take_profit_triggered,
         "stop_loss_triggered": stop_loss_triggered,

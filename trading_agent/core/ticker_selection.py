@@ -7,6 +7,7 @@ from trading_agent.core.data_hygiene import clean_text
 from trading_agent.core.human_intent import parse_human_intent
 from trading_agent.core.portfolio import position_for
 from trading_agent.core.portfolio import positions as portfolio_positions
+from trading_agent.core.ticker_symbols import normalize_ticker
 
 
 @dataclass(frozen=True)
@@ -23,8 +24,8 @@ def parse_watchlist(value: str | list[str] | tuple[str, ...] | None) -> list[str
     raw_items = value.split(",") if isinstance(value, str) else list(value)
     symbols: list[str] = []
     for item in raw_items:
-        symbol = clean_text(item, max_chars=16).upper()
-        if not _is_symbol(symbol):
+        symbol = normalize_ticker(clean_text(item, max_chars=16))
+        if not symbol:
             continue
         if symbol not in symbols:
             symbols.append(symbol)
@@ -46,7 +47,7 @@ def select_ticker(
     positioned_symbols = _open_position_tickers(portfolio)
     if "position_sweep" in human_intent.intents and positioned_symbols:
         candidates = [symbol for symbol in watchlist_symbols if symbol in positioned_symbols] or positioned_symbols
-        ticker = _rank(candidates, ticker_provider) or candidates[cycle_index % len(candidates)]
+        ticker = _rank(candidates, ticker_provider) or candidates[0]
         return TickerSelection(
             ticker=ticker,
             reason="human_position_sweep",
@@ -55,7 +56,7 @@ def select_ticker(
         )
 
     if positioned_symbols:
-        ticker = _rank(positioned_symbols, ticker_provider) or positioned_symbols[cycle_index % len(positioned_symbols)]
+        ticker = _rank(positioned_symbols, ticker_provider) or positioned_symbols[0]
         return TickerSelection(
             ticker=ticker,
             reason="open_position",
@@ -64,17 +65,18 @@ def select_ticker(
         )
 
     if watchlist_symbols:
-        ticker = _rank(watchlist_symbols, ticker_provider) or watchlist_symbols[cycle_index % len(watchlist_symbols)]
+        ranked = _rank(watchlist_symbols, ticker_provider)
+        ticker = ranked or watchlist_symbols[0]
         return TickerSelection(
             ticker=ticker,
-            reason="watchlist_rotation",
+            reason="provider_rank" if ranked else "stable_fallback",
             rationale=_selection_rationale(ticker, "No open position or explicit human ticker; selecting from current ticker universe.", human_input, portfolio),
             mentioned_tickers=[],
         )
 
     if fallback:
-        fallback_symbol = fallback.upper().strip()
-        if _is_symbol(fallback_symbol):
+        fallback_symbol = normalize_ticker(fallback)
+        if fallback_symbol:
             return TickerSelection(
                 ticker=fallback_symbol,
                 reason="fallback",
@@ -98,10 +100,6 @@ def _rank(candidates: list[str], ticker_provider: Any | None) -> str | None:
     if isinstance(picked, str) and picked.upper() in candidates:
         return picked.upper()
     return None
-
-
-def _is_symbol(value: str) -> bool:
-    return 1 <= len(value) <= 5 and value.isalpha() and value.isupper()
 
 
 def _open_position_tickers(portfolio: dict[str, Any] | None) -> list[str]:

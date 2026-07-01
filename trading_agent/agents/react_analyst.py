@@ -77,10 +77,7 @@ def react_analyst_decision(
     logger.info("analyst.llm.start ticker=%s mode=react", snapshot.ticker)
 
     if snapshot.price is None or snapshot.price_confidence in {"low", "none"}:
-        reason = (
-            "Current price is unavailable or unreliable after retry; trading is unsafe "
-            "because the agent cannot size or validate an order without a documented price"
-        )
+        reason = "Current price is unavailable or unreliable after retry; trading is unsafe " "because the agent cannot size or validate an order without a documented price"
         logger.warning(
             "react.price_guardrail ticker=%s price_confidence=%s",
             snapshot.ticker,
@@ -191,7 +188,7 @@ def react_analyst_decision(
     if human_trade_decision is not None:
         return human_trade_decision
 
-    rationale_details = _with_tool_audit(parsed.rationale_details, observations)
+    rationale_details = _with_tool_audit(parsed.rationale_details_dict(), observations)
     return TradingDecision(
         ticker=snapshot.ticker,
         action=parsed.action,
@@ -326,7 +323,7 @@ def _human_trade_decision(
 
     if action is None or quantity <= 0 or summary is None or guardrail is None:
         return None
-    details = _with_tool_audit(parsed.rationale_details, observations)
+    details = _with_tool_audit(parsed.rationale_details_dict(), observations)
     details.update(
         {
             "summary": summary,
@@ -341,10 +338,7 @@ def _human_trade_decision(
         action=action,
         quantity=quantity,
         confidence=max(parsed.confidence, 0.65),
-        rationale=(
-            f"{summary} For {snapshot.ticker}, overriding draft {parsed.action} to {action} "
-            f"within risk limits (max_buy_quantity={max_buy}, max_sell_quantity={max_sell})."
-        ),
+        rationale=(f"{summary} For {snapshot.ticker}, overriding draft {parsed.action} to {action} " f"within risk limits (max_buy_quantity={max_buy}, max_sell_quantity={max_sell})."),
         used_data_sources=[*(parsed.used_data_sources or snapshot.data_sources), "human_intent", "react_tools"],
         guardrails_triggered=[guardrail],
         reflection="ReAct tools used: " + (", ".join(item["tool"] for item in observations if item.get("tool")) or "none"),
@@ -359,7 +353,4 @@ def _human_intent_applies_to_ticker(human_intent, ticker: str) -> bool:
 
 def _human_position_sweep_summary(ticker: str, human_intent) -> str:
     topic = human_intent.impact_topic or "the user's broad risk topic"
-    return (
-        f"Human input requested a broad SELL sweep for open positions potentially impacted by {topic}. "
-        f"Selected {ticker.upper()} because it is an open position in the human-instruction sweep."
-    )
+    return f"Human input requested a broad SELL sweep for open positions potentially impacted by {topic}. " f"Selected {ticker.upper()} because it is an open position in the human-instruction sweep."

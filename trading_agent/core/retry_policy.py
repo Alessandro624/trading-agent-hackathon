@@ -12,6 +12,7 @@ class RetryPolicy:
     max_attempts: int = 2
     delay_seconds: float = 0.0
     retryable_exceptions: tuple[type[Exception], ...] = (Exception,)
+    should_retry: Callable[[Exception], bool] | None = None
 
     def run(self, operation: Callable[[], T], on_failure: Callable[[int, Exception], None] | None = None) -> T:
         last_error: Exception | None = None
@@ -22,6 +23,8 @@ class RetryPolicy:
                 last_error = error
                 if on_failure:
                     on_failure(attempt, error)
+                if self.should_retry is not None and not self.should_retry(error):
+                    break
                 if attempt < self.max_attempts and self.delay_seconds > 0:
                     sleep(self.delay_seconds)
         assert last_error is not None

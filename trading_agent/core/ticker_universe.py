@@ -6,6 +6,7 @@ from typing import Any
 from trading_agent.core.data_hygiene import clean_text
 from trading_agent.core.portfolio import positions as portfolio_positions
 from trading_agent.core.ticker_selection import parse_watchlist
+from trading_agent.core.ticker_symbols import normalize_ticker
 
 
 @dataclass(frozen=True)
@@ -43,14 +44,10 @@ def build_ticker_universe(
 
 
 def _add_symbol(symbols: list[str], sources: dict[str, list[str]], raw_symbol: str, source: str) -> None:
-    symbol = clean_text(str(raw_symbol), max_chars=16).upper()
-    if not _is_symbol(symbol):
+    symbol = normalize_ticker(clean_text(str(raw_symbol), max_chars=16))
+    if not symbol:
         return
     if symbol not in symbols:
         symbols.append(symbol)
     if source not in sources.setdefault(symbol, []):
         sources[symbol].append(source)
-
-
-def _is_symbol(value: str) -> bool:
-    return 1 <= len(value) <= 5 and value.isalpha() and value.isupper()

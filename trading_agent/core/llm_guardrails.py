@@ -1,22 +1,36 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Annotated, Any
 from typing import Literal
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from trading_agent.core.actions import Action, QUANTITY_RULE_TEXT, quantity_is_valid_for_action
 from trading_agent.core.models import MarketSnapshot
 
+ShortText = Annotated[str, Field(max_length=300)]
+SourceText = Annotated[str, Field(max_length=80)]
+
+
+class DecisionRationaleDetails(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(default="", max_length=500)
+    evidence: list[ShortText] = Field(default_factory=list, max_length=8)
+    risks: list[ShortText] = Field(default_factory=list, max_length=8)
+    data_quality: str = Field(default="", max_length=300)
+
 
 class AnalystDecisionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     action: Action
     quantity: int = Field(ge=0)
     confidence: float = Field(ge=0.0, le=1.0)
-    rationale: str = Field(min_length=10)
-    used_data_sources: list[str] = Field(default_factory=list)
-    rationale_details: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = Field(min_length=10, max_length=800)
+    used_data_sources: list[SourceText] = Field(default_factory=list, max_length=8)
+    rationale_details: DecisionRationaleDetails = Field(default_factory=DecisionRationaleDetails)
 
     @field_validator("quantity")
     @classmethod
@@ -26,21 +40,28 @@ class AnalystDecisionOutput(BaseModel):
             raise ValueError(QUANTITY_RULE_TEXT)
         return value
 
+    def rationale_details_dict(self) -> dict[str, Any]:
+        return self.rationale_details.model_dump()
+
 
 class ReflectionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     verdict: Literal["PROCEED", "HOLD"]
-    reflection: str = Field(min_length=10)
+    reflection: str = Field(min_length=10, max_length=800)
     confidence_adjustment: float = Field(ge=-0.5, le=0.5)
 
 
 class NewsOpinionOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     sentiment: Literal["positive", "negative", "neutral", "mixed", "unknown"]
     relevance: float = Field(ge=0.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)
-    evidence: list[str] = Field(default_factory=list)
-    risks: list[str] = Field(default_factory=list)
-    sources: list[str] = Field(default_factory=list)
-    summary: str = Field(min_length=10)
+    evidence: list[ShortText] = Field(default_factory=list, max_length=8)
+    risks: list[ShortText] = Field(default_factory=list, max_length=8)
+    sources: list[SourceText] = Field(default_factory=list, max_length=8)
+    summary: str = Field(min_length=10, max_length=800)
 
 
 def _loads_object(raw: str) -> dict:
@@ -72,7 +93,6 @@ def parse_news_opinion_output(raw: str) -> NewsOpinionOutput:
 
 
 def rationale_snapshot_mismatches(rationale: str, snapshot: MarketSnapshot) -> list[str]:
-    """Find obvious contradictions between LLM rationale and validated data."""
     text = rationale.lower()
     mismatches: list[str] = []
     has_reliable_price = snapshot.price is not None and snapshot.price_confidence in {"high", "medium"}
@@ -90,7 +110,6 @@ def rationale_snapshot_mismatches(rationale: str, snapshot: MarketSnapshot) -> l
 
 
 def snapshot_grounded_hold_rationale(snapshot: MarketSnapshot, reason: str) -> str:
-    """Build a HOLD rationale that cites only validated snapshot fields."""
     price_part = "price unavailable"
     if snapshot.price is not None:
         price_part = f"price {snapshot.price:.2f} with {snapshot.price_confidence} confidence"
@@ -118,9 +137,5 @@ def safe_rationale_details(snapshot: MarketSnapshot, summary: str, risks: list[s
             f"technical_confidence={snapshot.technical_indicators.confidence}",
         ],
         "risks": risks,
-        "data_quality": (
-            f"price {snapshot.price_confidence}, news {snapshot.news_confidence}, "
-            f"technical {snapshot.technical_indicators.confidence}"
-        ),
+        "data_quality": (f"price {snapshot.price_confidence}, news {snapshot.news_confidence}, " f"technical {snapshot.technical_indicators.confidence}"),
     }
-

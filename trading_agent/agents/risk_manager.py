@@ -15,13 +15,17 @@ def assess_risk(
     llm_client=None,
     human_risk_profile=None,
 ) -> RiskAssessment:
-    """Apply deterministic tradeability and sizing constraints before the LLM decides."""
     base_policy = risk_policy or RiskPolicy.from_env()
     human_risk_profile = human_risk_profile or resolve_human_risk_profile(human_input or [], llm_client)
     sizing = build_position_sizing_context(snapshot, portfolio, base_policy, human_risk_profile=human_risk_profile)
     portfolio_context = sizing["portfolio_context"]
     reasons = [sizing["risk_explanation"], portfolio_context, *sizing["risk_flags"]]
     hold_reasons = force_hold_reasons(snapshot.price_confidence, snapshot.guardrails_triggered)
+    current_position = (sizing.get("current_position") or {}) if isinstance(sizing.get("current_position"), dict) else {}
+    try:
+        current_quantity = float(current_position.get("qty") or 0.0)
+    except (TypeError, ValueError):
+        current_quantity = 0.0
     if hold_reasons:
         reason = "; ".join(hold_reasons)
         logger.warning("risk.blocked ticker=%s reason=%s", snapshot.ticker, reason)
@@ -32,11 +36,13 @@ def assess_risk(
             blocked_reason=reason,
             portfolio_context=portfolio_context,
             max_buy_quantity=int(sizing["max_buy_quantity"]),
+            max_explicit_notional_buy_quantity=int(sizing["max_explicit_notional_buy_quantity"]),
             max_sell_quantity=int(sizing["max_sell_quantity"]),
             stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
             take_profit_triggered=bool(sizing["take_profit_triggered"]),
             risk_flags=list(sizing["risk_flags"]),
             human_risk_profile=dict(sizing["human_risk_profile"]),
+            current_quantity=current_quantity,
         )
 
     max_quantity = int(sizing["max_quantity"])
@@ -49,11 +55,13 @@ def assess_risk(
             blocked_reason="risk policy allows no quantity",
             portfolio_context=portfolio_context,
             max_buy_quantity=0,
+            max_explicit_notional_buy_quantity=0,
             max_sell_quantity=0,
             stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
             take_profit_triggered=bool(sizing["take_profit_triggered"]),
             risk_flags=list(sizing["risk_flags"]),
             human_risk_profile=dict(sizing["human_risk_profile"]),
+            current_quantity=current_quantity,
         )
 
     assessment = RiskAssessment(
@@ -63,18 +71,21 @@ def assess_risk(
         blocked_reason=None,
         portfolio_context=portfolio_context,
         max_buy_quantity=int(sizing["max_buy_quantity"]),
+        max_explicit_notional_buy_quantity=int(sizing["max_explicit_notional_buy_quantity"]),
         max_sell_quantity=int(sizing["max_sell_quantity"]),
         stop_loss_triggered=bool(sizing["stop_loss_triggered"]),
         take_profit_triggered=bool(sizing["take_profit_triggered"]),
         risk_flags=list(sizing["risk_flags"]),
         human_risk_profile=dict(sizing["human_risk_profile"]),
+        current_quantity=current_quantity,
     )
     logger.info(
-        "risk.ok ticker=%s max_buy=%s max_sell=%s stop_loss=%s take_profit=%s",
+        "risk.ok ticker=%s max_buy=%s max_sell=%s stop_loss=%s take_profit=%s current_qty=%s",
         snapshot.ticker,
         assessment.max_buy_quantity,
         assessment.max_sell_quantity,
         assessment.stop_loss_triggered,
         assessment.take_profit_triggered,
+        assessment.current_quantity,
     )
     return assessment

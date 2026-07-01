@@ -60,7 +60,7 @@ from trading_agent.core.portfolio import (
     positions,
 )
 from trading_agent.core.retry_policy import RetryPolicy
-from trading_agent.core.risk_policy import RiskPolicy, build_position_sizing_context
+from trading_agent.core.risk_policy import RiskPolicy, build_position_sizing_context, normalize_requested_quantity
 from trading_agent.core.ticker_selection import TickerSelection, parse_watchlist, select_ticker
 from trading_agent.core.ticker_universe import TickerUniverse, build_ticker_universe
 
@@ -113,6 +113,7 @@ __all__ = [
     "news_confidence",
     "normalize_positions",
     "normalize_quantity_for_action",
+    "normalize_requested_quantity",
     "parse_analyst_output",
     "parse_human_intent",
     "parse_news_opinion_output",

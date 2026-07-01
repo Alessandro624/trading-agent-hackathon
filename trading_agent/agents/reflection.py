@@ -12,6 +12,7 @@ from trading_agent.core import (
     snapshot_grounded_hold_rationale,
 )
 from trading_agent.utils import get_logger, llm_metadata
+from trading_agent.utils.llm_clients import should_retry_llm_error
 
 logger = get_logger("reflection")
 
@@ -53,8 +54,36 @@ def reflect_decision(
     llm_client: LlmClient,
     retry_policy: RetryPolicy | None = None,
 ) -> TradingDecision:
-    retry_policy = retry_policy or RetryPolicy(max_attempts=2)
+    retry_policy = retry_policy or RetryPolicy(max_attempts=2, should_retry=should_retry_llm_error)
     metadata = llm_metadata(llm_client)
+    _FAST_PATH_ACTIONS = {"HOLD", "WAIT"}
+    _HARD_BLOCKERS = {
+        "guardrail:risk_manager_hold",
+        "guardrail:decision_quantity_above_action_risk_limit",
+        "guardrail:missing_required_market_data",
+        "guardrail:can_trade_false",
+    }
+    _HUMAN_TRADE_GUARDRAILS = {
+        "guardrail:human_buy_intent",
+        "guardrail:human_buy_intent_notional",
+        "guardrail:human_buy_intent_quantity",
+        "guardrail:human_sell_intent",
+        "guardrail:human_sell_intent_partial",
+    }
+    active_guardrails = set(draft.guardrails_triggered or [])
+    if draft.action in _FAST_PATH_ACTIONS:
+        has_blocker = bool(active_guardrails & _HARD_BLOCKERS) or draft.action == "WAIT"
+        if has_blocker:
+            logger.info("reflection.llm.skip ticker=%s action=%s reason=trivial_hold_wait", draft.ticker, draft.action)
+            draft.reflection = f"Reflection skipped: draft is {draft.action} with named blocker."
+            draft.llm_metadata = metadata
+            return draft
+    if active_guardrails & _HUMAN_TRADE_GUARDRAILS and not (active_guardrails & _HARD_BLOCKERS):
+        logger.info("reflection.llm.skip ticker=%s action=%s reason=human_forced_trade", draft.ticker, draft.action)
+        draft.reflection = "Reflection skipped: human-forced trade, no hard blocker."
+        draft.llm_metadata = metadata
+        return draft
+
     logger.info("reflection.llm.start ticker=%s draft_action=%s", draft.ticker, draft.action)
     prompt = json.dumps(
         {
@@ -107,7 +136,7 @@ def reflect_decision(
         )
 
     new_confidence = max(0.0, min(1.0, draft.confidence + parsed.confidence_adjustment))
-    if parsed.verdict == "HOLD":
+    if parsed.verdict == "HOLD" and _reflection_hold_allowed(draft):
         logger.warning("reflection.hold_override ticker=%s confidence=%.2f", draft.ticker, new_confidence)
         return TradingDecision(
             ticker=draft.ticker,
@@ -121,12 +150,40 @@ def reflect_decision(
             llm_metadata=_merge_metadata(draft.llm_metadata, metadata),
             rationale_details=_hold_override_details(draft, parsed.reflection),
         )
+    if parsed.verdict == "HOLD":
+        logger.info(
+            "reflection.hold_override.ignored ticker=%s reason=explicit_human_trade",
+            draft.ticker,
+        )
     draft.confidence = new_confidence
     draft.reflection = _merge_reflection(draft.reflection, parsed.reflection)
     draft.llm_metadata = _merge_metadata(draft.llm_metadata, metadata)
     draft.validate()
     logger.info("reflection.llm.result ticker=%s verdict=%s confidence=%.2f", draft.ticker, parsed.verdict, draft.confidence)
     return draft
+
+
+def _reflection_hold_allowed(draft: TradingDecision) -> bool:
+    guardrails = set(getattr(draft, "guardrails_triggered", None) or [])
+    explicit_human_trade = bool(
+        guardrails.intersection(
+            {
+                "guardrail:human_buy_intent",
+                "guardrail:human_buy_intent_notional",
+                "guardrail:human_buy_intent_quantity",
+                "guardrail:human_sell_intent",
+                "guardrail:human_sell_intent_partial",
+            }
+        )
+    )
+    if not explicit_human_trade:
+        return True
+    hard_blockers = {
+        "guardrail:risk_manager_hold",
+        "guardrail:decision_quantity_above_action_risk_limit",
+        "guardrail:missing_required_market_data",
+    }
+    return bool(guardrails.intersection(hard_blockers))
 
 
 def _merge_metadata(first: dict, second: dict) -> dict:
@@ -167,5 +224,3 @@ def _hold_override_details(draft: TradingDecision, reflection: str) -> dict:
         "risks": [reflection],
         "data_quality": (draft.rationale_details or {}).get("data_quality", "see snapshot confidence fields"),
     }
-
-

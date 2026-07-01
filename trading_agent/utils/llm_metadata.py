@@ -4,7 +4,6 @@ from trading_agent.core import LlmClient
 
 
 def llm_metadata(llm_client: LlmClient) -> dict:
-    """Normalize provider/fallback metadata for journal entries."""
     metadata = getattr(llm_client, "metadata", None)
     if callable(metadata):
         return metadata()

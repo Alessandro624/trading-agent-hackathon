@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,7 +17,17 @@ class _ChatJsonClientMixin:
         return _message_content(message, self.provider_name)
 
     def complete_structured(self, system_prompt: str, user_prompt: str, schema: type[Any]) -> Any:
-        return _structured_response(self._model(), system_prompt, user_prompt, schema)
+        structured_model = getattr(self, "_structured_model", None)
+        model = structured_model() if callable(structured_model) else self._model()
+        return _structured_response(
+            model,
+            system_prompt,
+            user_prompt,
+            schema,
+            method=getattr(self, "structured_method", "json_schema"),
+            max_tokens=getattr(self, "structured_max_tokens", 1024),
+            provider=self.provider_name,
+        )
 
     def complete_tool_plan(self, system_prompt: str, user_prompt: str, tools: list[dict[str, Any]]) -> dict[str, Any]:
         message = self._model().bind_tools(tools).invoke([("system", system_prompt), ("user", user_prompt)])
@@ -43,6 +54,9 @@ class OpenAiJsonClient(_ChatJsonClientMixin):
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OPENAI_TIMEOUT_SECONDS", 60)
         self.temperature = temperature if temperature is not None else _env_float("OPENAI_TEMPERATURE", 0)
         self.max_tokens = max_tokens if max_tokens is not None else _env_int("OPENAI_MAX_TOKENS", 1024)
+        self.structured_max_tokens = _env_int("OPENAI_STRUCTURED_MAX_TOKENS", 1024)
+        self.structured_method = _structured_method("OPENAI_STRUCTURED_METHOD", "json_schema")
+        self.http_max_retries = _env_int("OPENAI_HTTP_MAX_RETRIES", 0)
         self.provider_name = "openai"
         self._model_cache = None
 
@@ -52,7 +66,14 @@ class OpenAiJsonClient(_ChatJsonClientMixin):
                 from langchain_openai import ChatOpenAI
             except ImportError as error:
                 raise RuntimeError("Install LangChain dependencies with `uv sync` to use OpenAI models.") from error
-            self._model_cache = ChatOpenAI(api_key=self.api_key, model=self.model, temperature=self.temperature, timeout=self.timeout_seconds, max_tokens=self.max_tokens)
+            self._model_cache = ChatOpenAI(
+                api_key=self.api_key,
+                model=self.model,
+                temperature=self.temperature,
+                timeout=self.timeout_seconds,
+                max_tokens=self.max_tokens,
+                max_retries=self.http_max_retries,
+            )
         return self._model_cache
 
 
@@ -70,8 +91,11 @@ class OllamaJsonClient(_ChatJsonClientMixin):
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OLLAMA_TIMEOUT_SECONDS", 90)
         self.temperature = temperature if temperature is not None else _env_float("OLLAMA_TEMPERATURE", 0)
         self.max_tokens = max_tokens if max_tokens is not None else _env_int("OLLAMA_MAX_TOKENS", 1024)
+        self.structured_max_tokens = _env_int("OLLAMA_STRUCTURED_MAX_TOKENS", 1024)
+        self.structured_method = _structured_method("OLLAMA_STRUCTURED_METHOD", "json_schema")
         self.provider_name = "ollama"
         self._model_cache = None
+        self._structured_model_cache = None
 
     def _model(self):
         if self._model_cache is None:
@@ -87,6 +111,21 @@ class OllamaJsonClient(_ChatJsonClientMixin):
                 num_predict=self.max_tokens,
             )
         return self._model_cache
+
+    def _structured_model(self):
+        if self._structured_model_cache is None:
+            try:
+                from langchain_ollama import ChatOllama
+            except ImportError as error:
+                raise RuntimeError("Install LangChain dependencies with `uv sync` to use Ollama models.") from error
+            self._structured_model_cache = ChatOllama(
+                model=self.model,
+                base_url=self.base_url,
+                temperature=self.temperature,
+                timeout=self.timeout_seconds,
+                num_predict=self.structured_max_tokens,
+            )
+        return self._structured_model_cache
 
 
 class OpenRouterJsonClient(_ChatJsonClientMixin):
@@ -104,6 +143,9 @@ class OpenRouterJsonClient(_ChatJsonClientMixin):
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else _env_float("OPENROUTER_TIMEOUT_SECONDS", 60)
         self.temperature = temperature if temperature is not None else _env_float("OPENROUTER_TEMPERATURE", 0)
         self.max_tokens = max_tokens if max_tokens is not None else _env_int("OPENROUTER_MAX_TOKENS", 1024)
+        self.structured_max_tokens = _env_int("OPENROUTER_STRUCTURED_MAX_TOKENS", 1024)
+        self.structured_method = _structured_method("OPENROUTER_STRUCTURED_METHOD", "json_schema")
+        self.http_max_retries = _env_int("OPENROUTER_HTTP_MAX_RETRIES", 0)
         self.provider_name = "openrouter"
         self._model_cache = None
 
@@ -120,6 +162,7 @@ class OpenRouterJsonClient(_ChatJsonClientMixin):
                 temperature=self.temperature,
                 timeout=self.timeout_seconds,
                 max_tokens=self.max_tokens,
+                max_retries=self.http_max_retries,
             )
         return self._model_cache
 
@@ -158,6 +201,7 @@ class FallbackLlmClient:
         return dict(self._metadata)
 
     def _with_fallback(self, call, empty_message: str):
+        primary_started = time.perf_counter()
         try:
             value = call(self.primary)
             if not value:
@@ -165,7 +209,31 @@ class FallbackLlmClient:
             self._metadata = _metadata(_provider_name(self.primary))
             return value
         except Exception as error:
-            value = call(self.fallback)
+            logger.warning(
+                "Primary LLM provider %s failed after %dms: %s. Falling back to %s.",
+                _provider_name(self.primary),
+                int((time.perf_counter() - primary_started) * 1000),
+                error,
+                _provider_name(self.fallback),
+            )
+            fallback_started = time.perf_counter()
+            try:
+                value = call(self.fallback)
+            except Exception as fallback_error:
+                logger.error(
+                    "Fallback LLM provider %s failed after %dms: %s",
+                    _provider_name(self.fallback),
+                    int((time.perf_counter() - fallback_started) * 1000),
+                    fallback_error,
+                )
+                raise RuntimeError(
+                    f"primary provider failed: {error}; fallback provider failed: {fallback_error}"
+                ) from fallback_error
+            logger.info(
+                "Fallback LLM provider %s completed after %dms",
+                _provider_name(self.fallback),
+                int((time.perf_counter() - fallback_started) * 1000),
+            )
             self._metadata = _metadata(
                 _provider_name(self.fallback),
                 fallback_used=True,
@@ -174,8 +242,43 @@ class FallbackLlmClient:
             return value
 
 
-def _structured_response(model, system_prompt, user_prompt, schema):
-    return model.with_structured_output(schema).invoke([("system", system_prompt), ("user", user_prompt)])
+def _structured_response(
+    model,
+    system_prompt,
+    user_prompt,
+    schema,
+    *,
+    method: str,
+    max_tokens: int,
+    provider: str,
+):
+    invoke_kwargs = {} if provider == "ollama" else {"max_tokens": max_tokens}
+    return model.with_structured_output(schema, method=method).invoke(
+        [("system", system_prompt), ("user", user_prompt)],
+        **invoke_kwargs,
+    )
+
+
+def should_retry_llm_error(error: Exception) -> bool:
+    text = str(error).lower()
+    terminal_markers = (
+        "length limit was reached",
+        "finish_reason='length'",
+        'finish_reason="length"',
+        "context_length_exceeded",
+        "maximum context length",
+        "unexpected keyword argument",
+        "unsupported parameter",
+        "not supported",
+        "does not support",
+    )
+    return not any(marker in text for marker in terminal_markers)
+
+
+def _structured_method(env_name: str, default: str) -> str:
+    method = os.getenv(env_name, default).strip().lower()
+    allowed = {"json_schema", "function_calling", "json_mode"}
+    return method if method in allowed else default
 
 
 def _invoke_bound_tools(model, system_prompt: str, user_prompt: str, tools: list[Any]) -> tuple[list[dict[str, Any]], dict]:

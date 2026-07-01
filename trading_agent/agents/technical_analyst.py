@@ -7,7 +7,6 @@ logger = get_logger("technical_analyst")
 
 
 def technical_opinion(snapshot: MarketSnapshot) -> TechnicalOpinion:
-    """Turn validated indicators into a compact technical view for the decision agent."""
     indicators = snapshot.technical_indicators
     summary = indicators.summary()
     evidence = [summary]

@@ -5,6 +5,20 @@ from datetime import datetime
 from pathlib import Path
 from shutil import copyfile
 
+RESUMABLE_SIDECARS = (
+    "human_input.md",
+    "human_input.cursor",
+    "constraints.json",
+    "scheduled_actions.json",
+    "conditional_orders.json",
+    "pending_confirmations.json",
+    "instruction_ledger.json",
+    "agent_replies.md",
+    "agent_replies.jsonl",
+    "resolver_cache.json",
+    "sector_cache.json",
+)
+
 
 @dataclass(frozen=True)
 class RunContext:
@@ -32,8 +46,8 @@ def create_run_context(base_dir: Path, ticker: str | None = None, resume_from: P
     )
     if context.resumed_from:
         copyfile(context.resumed_from, context.journal_path)
-        _copy_resume_sidecar(context.resumed_from.parent, context.run_dir, "human_input.md")
-        _copy_resume_sidecar(context.resumed_from.parent, context.run_dir, "human_input.cursor")
+        for sidecar in RESUMABLE_SIDECARS:
+            _copy_resume_sidecar(context.resumed_from.parent, context.run_dir, sidecar)
     _ensure_human_input_sidecars(context)
     return context
 

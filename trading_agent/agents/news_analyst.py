@@ -6,6 +6,7 @@ from typing import Any
 from trading_agent.core import JournalEntry, LlmClient, MarketSnapshot, NewsOpinion, NewsOpinionOutput, NewsProvider, RetryPolicy
 from trading_agent.tools import langchain_market_context_tools, langchain_news_search_tool, run_market_context_tools, snapshot_payload
 from trading_agent.utils import get_logger
+from trading_agent.utils.llm_clients import should_retry_llm_error
 
 logger = get_logger("news_analyst")
 
@@ -25,7 +26,7 @@ def news_opinion(
     news_provider: NewsProvider,
     retry_policy: RetryPolicy | None = None,
 ) -> NewsOpinion:
-    retry_policy = retry_policy or RetryPolicy(max_attempts=2)
+    retry_policy = retry_policy or RetryPolicy(max_attempts=2, should_retry=should_retry_llm_error)
     observations = _news_observations(snapshot, recent_entries, llm_client, news_provider)
     base_payload = {"snapshot": snapshot_payload(snapshot), "tool_observations": observations}
     errors: list[str] = []

@@ -1,8 +1,48 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass
+from typing import Any
 
 from trading_agent.core.data_hygiene import clean_text
+
+_NON_USD_SYMBOL_PATTERNS = [
+    re.compile(r"€\s*\d"),
+    re.compile(r"£\s*\d"),
+    re.compile(r"¥\s*\d"),
+    re.compile(r"\b\d[\d.,]*\s*(EUR|GBP|JPY|CHF|CAD|AUD|SEK|NOK|CNY|INR|BRL)\b", re.IGNORECASE),
+]
+_NON_USD_SYMBOL_LABEL = {
+    "€": "EUR",
+    "£": "GBP",
+    "¥": "JPY",
+    "EUR": "EUR",
+    "GBP": "GBP",
+    "JPY": "JPY",
+    "CHF": "CHF",
+    "CAD": "CAD",
+    "AUD": "AUD",
+    "SEK": "SEK",
+    "NOK": "NOK",
+    "CNY": "CNY",
+    "INR": "INR",
+    "BRL": "BRL",
+}
+
+
+def detect_non_usd_currency(note: str) -> str | None:
+    if not note:
+        return None
+    for pattern in _NON_USD_SYMBOL_PATTERNS:
+        match = pattern.search(note)
+        if not match:
+            continue
+        token = match.group(0).strip()
+        for symbol, label in _NON_USD_SYMBOL_LABEL.items():
+            if symbol in token:
+                return label
+        return "NON_USD"
+    return None
 
 
 @dataclass(frozen=True)
@@ -67,6 +107,61 @@ def split_compound_note(note: str) -> list[str]:
     if not cleaned:
         return []
     return [cleaned]
+
+
+_LLM_SPLITTER_PROMPT = """Split this human note into atomic intent units.
+Return ONLY JSON: {"notes": ["intent1", "intent2"]}
+Each note must contain exactly one intent.
+- Preserve the original language (English/Italian/...).
+- Preserve tickers, sectors, currencies, and percentages verbatim.
+- "and" / "then" / commas are the typical splitters.
+- Keep qualifiers such as "associated shares" attached to the company or industry they qualify.
+- Keep all sectors requested in one rebalance intent; do not emit one rebalance note per sector.
+- If the note is a single intent, return a one-element list.
+- Do NOT invent content; only split what the user wrote.
+- If the note is purely conversational with no actionable intent, return [original].
+
+Examples:
+  "Buy AAPL, sell META" -> ["Buy AAPL", "sell META"]
+  "Buy tech and energy, sell consumer" -> ["Buy tech", "Buy energy", "sell consumer"]
+  "Buy SpaceX and balance with manufacturing" -> ["Buy SpaceX", "balance portfolio with manufacturing"]
+  "Buy an aircraft company and associated market shares" -> ["Buy an aircraft company and associated market shares"]
+  "balance with manufacturing and goods retail" -> ["balance with manufacturing and goods retail"]
+  "Take profits on NVDA, then short TSLA" -> ["Take profits on NVDA", "short TSLA"]
+  "What's my P&L?" -> ["What's my P&L?"]
+"""
+
+
+def llm_split_compound_note(note: str, llm_client: Any) -> list[str]:
+    import json as _json
+
+    if not note or not llm_client:
+        return split_compound_note(note)
+    complete_json = getattr(llm_client, "complete_json", None)
+    if not callable(complete_json):
+        return split_compound_note(note)
+    try:
+        raw = complete_json(_LLM_SPLITTER_PROMPT, note)
+        text = str(raw or "").strip()
+        try:
+            parsed = _json.loads(text)
+        except _json.JSONDecodeError:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end <= start:
+                return split_compound_note(note)
+            parsed = _json.loads(text[start : end + 1])
+        notes_list = parsed.get("notes") if isinstance(parsed, dict) else None
+        if not isinstance(notes_list, list) or not notes_list:
+            return split_compound_note(note)
+        cleaned: list[str] = []
+        for item in notes_list:
+            text_item = clean_text(str(item), max_chars=1000)
+            if text_item:
+                cleaned.append(text_item)
+        return cleaned or split_compound_note(note)
+    except Exception:
+        return split_compound_note(note)
 
 
 def _extract_impact_topic(text: str) -> str | None:

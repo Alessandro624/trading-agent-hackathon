@@ -148,11 +148,13 @@ class RiskAssessment:
     blocked_reason: str | None
     portfolio_context: str = ""
     max_buy_quantity: int = 0
+    max_explicit_notional_buy_quantity: int = 0
     max_sell_quantity: int = 0
     stop_loss_triggered: bool = False
     take_profit_triggered: bool = False
     risk_flags: list[str] = field(default_factory=list)
     human_risk_profile: dict[str, Any] = field(default_factory=dict)
+    current_quantity: float = 0.0
 
     def __post_init__(self) -> None:
         self.validate()
@@ -160,7 +162,7 @@ class RiskAssessment:
     def validate(self) -> None:
         if self.max_quantity < 0:
             raise ValueError("risk max_quantity must be >= 0")
-        if self.max_buy_quantity < 0 or self.max_sell_quantity < 0:
+        if self.max_buy_quantity < 0 or self.max_explicit_notional_buy_quantity < 0 or self.max_sell_quantity < 0:
             raise ValueError("risk action quantities must be >= 0")
         if not isinstance(self.reasons, list):
             raise ValueError("risk reasons must be a list")
